@@ -1,0 +1,1143 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+PW_APP_DIR="${PW_APP_DIR:-${ROOT_DIR}/dist/PolicyWitness.app}"
+source "${ROOT_DIR}/tests/lib/case.sh"
+
+PW_TEST_SUITE="runner_use_c_worker"
+PW_BIN="${PW_BIN:-${PW_APP_DIR}/Contents/MacOS/policy-witness}"
+
+# ---- exec_fixture helper (built on demand by exec_* test cases) ----------
+#
+# Source lives under tests/fixtures/exec/helper.c;
+# the compiled binary lands in tests/out/exec_fixture/helper. Not
+# in the app bundle, not signed, not notarized — purely a test fixture
+# the exec attempt cases drive through PW.
+EXEC_FIXTURE_SRC="${ROOT_DIR}/tests/fixtures/exec/helper.c"
+EXEC_FIXTURE_BIN="${PW_TEST_OUT_DIR}/exec_fixture/helper"
+exec_fixture_built=0
+
+ensure_exec_fixture() {
+  if [[ "${exec_fixture_built}" -eq 1 ]]; then return 0; fi
+  if [[ ! -f "${EXEC_FIXTURE_SRC}" ]]; then
+    return 1
+  fi
+  mkdir -p "$(dirname "${EXEC_FIXTURE_BIN}")"
+  if ! bash "${ROOT_DIR}/tests/fixtures/exec/build.sh" "${EXEC_FIXTURE_BIN}" \
+       2>"${PW_TEST_OUT_DIR}/exec_fixture/build.err"; then
+    return 1
+  fi
+  exec_fixture_built=1
+  return 0
+}
+
+# ---- test_id: happy_default_allow ----------------------------------------
+
+run_happy_default_allow() {
+  local test_id="happy_default_allow"
+  test_selected "${test_id}" || return 0
+  test_begin "${PW_TEST_SUITE}" "${test_id}"
+  test_step "run" "C-worker code path (pw-probe-runner + sb_api_validator --batch via CWorkerOrchestrator) assembles a complete current-schema envelope"
+
+  if ! require_pw_app "${PW_BIN}"; then exit 0; fi
+
+  local specimen="${PW_TEST_ARTIFACTS}/specimen.json"
+  cat >"${specimen}" <<'EOF'
+{
+  "schema_version": 5,
+  "specimen_id": "use_c_worker_happy",
+  "policy": {
+    "format": "sbpl",
+    "sbpl_source": "(version 1)(allow default)"
+  },
+  "probe_plan": [{
+    "step_id": "s1",
+    "sandbox_check": {
+      "operation": "file-read-data",
+      "filter": {"kind": "path", "value": "/etc/hosts"}
+    },
+    "attempt": {"kind": "file", "action": "open_read", "target": "/etc/hosts"}
+  }]
+}
+EOF
+
+  local run_stdout="${PW_TEST_ARTIFACTS}/run.json"
+  set +e
+  "${PW_BIN}" run "${specimen}" >"${run_stdout}" 2>/dev/null
+  local rc=$?
+  set -e
+  if [[ "${rc}" -ne 0 ]]; then
+    test_fail "specimen failed (rc=${rc})" "{\"stdout\":\"${run_stdout}\"}"
+    return 0
+  fi
+
+  local assert_log="${PW_TEST_ARTIFACTS}/assert.log"
+  set +e
+  "${PW_PYTHON}" -B -S -P - "${run_stdout}" "${ROOT_DIR}/tests/lib" >"${assert_log}" 2>&1 <<'PY'
+import json, sys
+sys.path.insert(0, sys.argv[2])
+import consumer
+env = json.loads(open(sys.argv[1]).read())
+assert not consumer.validate(env), consumer.validate(env)
+r = env["data"]["runner_result"]
+
+# Envelope shape: both subprocess records + override mirrored back.
+assert r["normalized_outcome"] == "ok", "outcome {0}".format(r["normalized_outcome"])
+assert r["rc"] == 0
+assert r["phases"][0]["validator_subprocess"] is not None, "validator_subprocess missing"
+assert r["phases"][0]["validator_subprocess"]["exit_code"] == 0
+assert r["runner_subprocess"] is not None, "runner_subprocess missing"
+assert r["runner_subprocess"]["exit_code"] == 0
+# Production-shape specimens carry no _test_overrides, so the
+# envelope should report test_overrides=null.
+assert r.get("test_overrides") is None, "expected null test_overrides for production-shape run"
+
+# top-level pid is the worker.
+assert r["pid"] == r["runner_subprocess"]["pid"], "top-level pid should equal runner_subprocess.pid"
+
+# Step: validator predicted allow, attempt observed ok, record says succeeded.
+assert len(r["steps"]) == 1
+s = r["steps"][0]
+assert s["sandbox_check"]["outcome"] == "allow"
+assert s["attempt"]["outcome"] == "ok"
+assert s["attempt"]["observed_path"] == "/private/etc/hosts"
+assert s["comparison"]["observation"] == "succeeded", s["comparison"]
+assert s["comparison"]["order"] == "query_first" and s["comparison"]["limitations"] == [], s["comparison"]
+print("ok: current-schema envelope, validator+worker subprocesses present, succeeded record")
+PY
+  local arc=$?
+  set -e
+  if [[ "${arc}" -ne 0 ]]; then
+    local msg
+    msg="$(head -5 "${assert_log}" | tr '\n' ' ' | sed 's/"/\\"/g')"
+    test_fail "${msg}" "{\"log\":\"${assert_log}\",\"stdout\":\"${run_stdout}\"}"
+    return 0
+  fi
+  test_pass "C-worker path produces a complete current-schema envelope; allow/ok reports a succeeded record" "{\"stdout\":\"${run_stdout}\"}"
+}
+
+# ---- test_id: bare_deny_default ------------------------------------------
+
+run_bare_deny_default() {
+  local test_id="bare_deny_default"
+  test_selected "${test_id}" || return 0
+  test_begin "${PW_TEST_SUITE}" "${test_id}"
+  test_step "run" "the downstream bug-report shape: (deny default) produces a coherent envelope on the C-worker path"
+
+  if ! require_pw_app "${PW_BIN}"; then exit 0; fi
+
+  local specimen="${PW_TEST_ARTIFACTS}/specimen.json"
+  cat >"${specimen}" <<'EOF'
+{
+  "schema_version": 5,
+  "specimen_id": "use_c_worker_deny_default",
+  "policy": {
+    "format": "sbpl",
+    "sbpl_source": "(version 1)(deny default)"
+  },
+  "probe_plan": [{
+    "step_id": "s1",
+    "sandbox_check": {
+      "operation": "file-read-data",
+      "filter": {"kind": "path", "value": "/etc/hosts"}
+    },
+    "attempt": {"kind": "file", "action": "open_read", "target": "/etc/hosts"}
+  }]
+}
+EOF
+
+  local run_stdout="${PW_TEST_ARTIFACTS}/run.json"
+  set +e
+  "${PW_BIN}" run "${specimen}" >"${run_stdout}" 2>/dev/null
+  local rc=$?
+  set -e
+  if [[ "${rc}" -ne 0 ]]; then
+    test_fail "specimen failed (rc=${rc})" "{\"stdout\":\"${run_stdout}\"}"
+    return 0
+  fi
+
+  local assert_log="${PW_TEST_ARTIFACTS}/assert.log"
+  set +e
+  "${PW_PYTHON}" -B -S -P - "${run_stdout}" >"${assert_log}" 2>&1 <<'PY'
+import json, sys
+env = json.loads(open(sys.argv[1]).read())
+r = env["data"]["runner_result"]
+
+# The run itself succeeded — both children completed cleanly.
+# The envelope carries the verdict AND the observation as separate
+# channels; the record relates them without attributing the failure.
+assert r["normalized_outcome"] == "ok", "outcome {0}".format(r["normalized_outcome"])
+assert r["rc"] == 0
+assert r["runner_subprocess"]["exit_code"] == 0, "worker should clean-exit under (deny default)"
+
+s = r["steps"][0]
+# Validator predicted deny; kernel actually denied; both agree.
+assert s["sandbox_check"]["outcome"] == "deny", "sb={0}".format(s["sandbox_check"]["outcome"])
+assert s["attempt"]["rc"] == 1, "attempt rc={0}".format(s["attempt"]["rc"])
+# EPERM=1 or EACCES=13.
+assert s["attempt"]["errno"] in (1, 13), "attempt errno={0}".format(s["attempt"]["errno"])
+assert s["attempt"]["outcome"] == "open_failed"
+assert (s["comparison"]["observation"], s["comparison"]["observation_basis"]) == ("permission_failure", "permission_errno"), s["comparison"]
+assert s["comparison"]["limitations"] == [], s["comparison"]
+
+print("ok: worker survived (deny default); deny prediction beside a permission failure by errno")
+PY
+  local arc=$?
+  set -e
+  if [[ "${arc}" -ne 0 ]]; then
+    local msg
+    msg="$(head -5 "${assert_log}" | tr '\n' ' ' | sed 's/"/\\"/g')"
+    test_fail "${msg}" "{\"log\":\"${assert_log}\",\"stdout\":\"${run_stdout}\"}"
+    return 0
+  fi
+  test_pass "bug-report (deny default) shape: worker survives, deny prediction beside a permission failure by errno" "{\"stdout\":\"${run_stdout}\"}"
+}
+
+# ---- test_id: prediction_unavailable_pair --------------------------------
+
+run_prediction_unavailable_pair() {
+  local test_id="prediction_unavailable_pair"
+  test_selected "${test_id}" || return 0
+  test_begin "${PW_TEST_SUITE}" "${test_id}"
+  test_step "run" "an op+filter pair in the prediction_unavailable set: orchestrator skips the validator probe, synthesizes the verdict directly"
+
+  if ! require_pw_app "${PW_BIN}"; then exit 0; fi
+
+  local specimen="${PW_TEST_ARTIFACTS}/specimen.json"
+  cat >"${specimen}" <<'EOF'
+{
+  "schema_version": 5,
+  "specimen_id": "use_c_worker_prediction_unavailable",
+  "policy": {
+    "format": "sbpl",
+    "sbpl_source": "(version 1)(allow default)(deny iokit-open-service (iokit-registry-entry-class \"IOSurfaceRoot\"))"
+  },
+  "probe_plan": [{
+    "step_id": "s1",
+    "sandbox_check": {
+      "operation": "iokit-open-service",
+      "filter": {"kind": "iokit_registry_entry_class", "value": "IOSurfaceRoot"}
+    },
+    "attempt": {"kind": "file", "action": "open_read", "target": "/etc/hosts"}
+  }]
+}
+EOF
+
+  local run_stdout="${PW_TEST_ARTIFACTS}/run.json"
+  set +e
+  "${PW_BIN}" run "${specimen}" >"${run_stdout}" 2>/dev/null
+  local rc=$?
+  set -e
+  if [[ "${rc}" -ne 0 ]]; then
+    test_fail "specimen failed (rc=${rc})" "{\"stdout\":\"${run_stdout}\"}"
+    return 0
+  fi
+
+  local assert_log="${PW_TEST_ARTIFACTS}/assert.log"
+  set +e
+  "${PW_PYTHON}" -B -S -P - "${run_stdout}" >"${assert_log}" 2>&1 <<'PY'
+import json, sys
+env = json.loads(open(sys.argv[1]).read())
+r = env["data"]["runner_result"]
+s = r["steps"][0]
+
+# Verdict was synthesized — validator was never asked.
+assert s["sandbox_check"]["outcome"] == "prediction_unavailable", \
+    "sb_outcome={0}".format(s["sandbox_check"]["outcome"])
+assert s["sandbox_check"]["rc"] == -1, \
+    "rc sentinel expected -1, got {0}".format(s["sandbox_check"]["rc"])
+# The planning exclusion is said by the record: no order, the pair limitation.
+assert s["comparison"]["order"] == "unestablished", s["comparison"]
+assert s["comparison"]["limitations"] == ["query_plan:prediction_unavailable_pair"], s["comparison"]
+# The attempt still ran (and succeeded under allow default + the iokit
+# deny that doesn't cover /etc/hosts file reads).
+assert s["attempt"]["outcome"] == "ok"
+assert s["comparison"]["observation"] == "succeeded", s["comparison"]
+print("ok: prediction_unavailable verdict synthesized; validator not asked; record names the planning exclusion")
+PY
+  local arc=$?
+  set -e
+  if [[ "${arc}" -ne 0 ]]; then
+    local msg
+    msg="$(head -5 "${assert_log}" | tr '\n' ' ' | sed 's/"/\\"/g')"
+    test_fail "${msg}" "{\"log\":\"${assert_log}\",\"stdout\":\"${run_stdout}\"}"
+    return 0
+  fi
+  test_pass "(op,filter) in prediction_unavailable set: verdict synthesized, record names the exclusion" "{\"stdout\":\"${run_stdout}\"}"
+}
+
+# ---- test_id: duplicate_step_id_rejected (PR H #1 regression) ------------
+
+run_duplicate_step_id_rejected() {
+  local test_id="duplicate_step_id_rejected"
+  test_selected "${test_id}" || return 0
+  test_begin "${PW_TEST_SUITE}" "${test_id}"
+  test_step "run" "two probe steps with the same step_id → bad_request (used to trap the Dictionary join and kill the XPC service)"
+
+  if ! require_pw_app "${PW_BIN}"; then exit 0; fi
+
+  local specimen="${PW_TEST_ARTIFACTS}/specimen.json"
+  cat >"${specimen}" <<'EOF'
+{
+  "schema_version": 5,
+  "specimen_id": "use_c_worker_dup_step_id",
+  "policy": {"format": "sbpl", "sbpl_source": "(version 1)(allow default)"},
+  "probe_plan": [
+    {"step_id": "dup", "sandbox_check": {"operation": "file-read-data", "filter": {"kind": "path", "value": "/etc/hosts"}}, "attempt": {"kind": "file", "action": "open_read", "target": "/etc/hosts"}},
+    {"step_id": "dup", "sandbox_check": {"operation": "file-read-data", "filter": {"kind": "path", "value": "/etc/hosts"}}, "attempt": {"kind": "file", "action": "open_read", "target": "/etc/hosts"}}
+  ]
+}
+EOF
+
+  local run_stdout="${PW_TEST_ARTIFACTS}/run.json"
+  set +e
+  "${PW_BIN}" run "${specimen}" >"${run_stdout}" 2>/dev/null
+  set -e
+
+  local assert_log="${PW_TEST_ARTIFACTS}/assert.log"
+  set +e
+  "${PW_PYTHON}" -B -S -P - "${run_stdout}" >"${assert_log}" 2>&1 <<'PY'
+import json, sys
+env = json.loads(open(sys.argv[1]).read())
+r = env["data"]["runner_result"]
+assert r["normalized_outcome"] == "bad_request", "outcome={0}".format(r["normalized_outcome"])
+assert r["rc"] == 1
+assert "duplicate step_id" in (r.get("error") or ""), \
+    "error should name the duplicate: {0!r}".format(r.get("error"))
+assert r.get("runner_subprocess") is None, "no worker should have spawned"
+assert (r.get("phases") or [{}])[0].get("validator_subprocess") is None, "no validator should have spawned"
+assert r["steps"] == []
+print("ok: duplicate step_id rejected pre-spawn as bad_request")
+PY
+  local arc=$?
+  set -e
+  if [[ "${arc}" -ne 0 ]]; then
+    local msg
+    msg="$(head -5 "${assert_log}" | tr '\n' ' ' | sed 's/"/\\"/g')"
+    test_fail "${msg}" "{\"log\":\"${assert_log}\",\"stdout\":\"${run_stdout}\"}"
+    return 0
+  fi
+  test_pass "duplicate step_id → bad_request before spawn (no XPC crash)" "{\"stdout\":\"${run_stdout}\"}"
+}
+
+# ---- test_id: unsupported_attempt_rejected --------------------------
+
+run_unsupported_attempt_rejected() {
+  local test_id="unsupported_attempt_rejected"
+  test_selected "${test_id}" || return 0
+  test_begin "${PW_TEST_SUITE}" "${test_id}"
+  test_step "run" "unknown (kind, action) combo refuses the whole specimen before children"
+
+  if ! require_pw_app "${PW_BIN}"; then exit 0; fi
+
+  # A later unsupported attempt must prevent the valid earlier step.
+  local specimen="${PW_TEST_ARTIFACTS}/specimen.json"
+  cat >"${specimen}" <<'EOF'
+{
+  "schema_version": 5,
+  "specimen_id": "use_c_worker_mixed_attempt_support",
+  "policy": {"format": "sbpl", "sbpl_source": "(version 1)(deny default)(allow file-read*)"},
+  "probe_plan": [
+    {"step_id": "good",
+     "sandbox_check": {"operation": "file-read-data", "filter": {"kind": "path", "value": "/etc/hosts"}},
+     "attempt": {"kind": "file", "action": "open_read", "target": "/etc/hosts"}},
+    {"step_id": "unknown_attempt",
+     "sandbox_check": {"operation": "iokit-open-user-client", "filter": {"kind": "none"}},
+     "attempt": {"kind": "iokit", "action": "open", "target": "irrelevant"}}
+  ]
+}
+EOF
+
+  local run_stdout="${PW_TEST_ARTIFACTS}/run.json"
+  set +e
+  "${PW_BIN}" run "${specimen}" >"${run_stdout}" 2>/dev/null
+  set -e
+
+  local assert_log="${PW_TEST_ARTIFACTS}/assert.log"
+  set +e
+  "${PW_PYTHON}" -B -S -P - "${run_stdout}" >"${assert_log}" 2>&1 <<'PY'
+import json, sys
+env = json.loads(open(sys.argv[1]).read())
+r = env["data"]["runner_result"]
+
+assert env["result"]["normalized_outcome"] == "bad_request", env
+assert env["result"]["exit_code"] == 1, env
+assert r["normalized_outcome"] == "bad_request" and r["rc"] == 1, r
+expected = {"code": "unsupported_attempt", "path": ["probe_plan", "1", "attempt"]}
+assert env["data"]["request_failure"] == r["request_failure"] == expected, r
+assert r["steps"] == [] and r.get("runner_subprocess") is None, r
+assert (r.get("phases") or [{}])[0].get("validator_subprocess") is None, r
+print("ok: unsupported attempt refuses all steps before children")
+PY
+  local arc=$?
+  set -e
+  if [[ "${arc}" -ne 0 ]]; then
+    local msg
+    msg="$(head -5 "${assert_log}" | tr '\n' ' ' | sed 's/"/\\"/g')"
+    test_fail "${msg}" "{\"log\":\"${assert_log}\",\"stdout\":\"${run_stdout}\"}"
+    return 0
+  fi
+  test_pass "unsupported attempt → bad_request before any step executes" "{\"stdout\":\"${run_stdout}\"}"
+}
+
+# ---- test_id: worker_timeout_ms_honored ---------------------------------
+
+run_worker_timeout_ms_honored() {
+  local test_id="worker_timeout_ms_honored"
+  test_selected "${test_id}" || return 0
+  test_begin "${PW_TEST_SUITE}" "${test_id}"
+  test_require_pw
+  test_step run "worker deadline fires while a completed write retains its effect and evidence"
+  test_check_python "${PW_TEST_ARTIFACTS}/assert.log" "successful-write worker timeout contract failed" \
+    "${ROOT_DIR}/tests/suites/runner_outcome_runner_timeout/check.py" \
+    write "${PW_BIN}" "${PW_TEST_ARTIFACTS}"
+  test_pass "worker timeout preserves the completed write, its file effect, and its succeeded record"
+}
+
+# ---- test_id: sandbox_check_pid_matches_worker (PR H #7 regression) ------
+
+run_sandbox_check_pid_matches_worker() {
+  local test_id="sandbox_check_pid_matches_worker"
+  test_selected "${test_id}" || return 0
+  test_begin "${PW_TEST_SUITE}" "${test_id}"
+  test_step "run" "sandbox_check.pid on every step matches the worker PID (pre-fix was 0 for validator-backed, host PID for synthesized)"
+
+  if ! require_pw_app "${PW_BIN}"; then exit 0; fi
+
+  local specimen="${PW_TEST_ARTIFACTS}/specimen.json"
+  cat >"${specimen}" <<'EOF'
+{
+  "schema_version": 5,
+  "specimen_id": "use_c_worker_sb_pid",
+  "policy": {"format": "sbpl", "sbpl_source": "(version 1)(allow default)"},
+  "probe_plan": [
+    {"step_id": "s_validator", "sandbox_check": {"operation": "file-read-data", "filter": {"kind": "path", "value": "/etc/hosts"}}, "attempt": {"kind": "file", "action": "open_read", "target": "/etc/hosts"}},
+    {"step_id": "s_synth", "sandbox_check": {"operation": "iokit-open-service", "filter": {"kind": "iokit_registry_entry_class", "value": "IOSurfaceRoot"}}, "attempt": {"kind": "file", "action": "open_read", "target": "/etc/hosts"}}
+  ]
+}
+EOF
+
+  local run_stdout="${PW_TEST_ARTIFACTS}/run.json"
+  set +e
+  "${PW_BIN}" run "${specimen}" >"${run_stdout}" 2>/dev/null
+  set -e
+
+  local assert_log="${PW_TEST_ARTIFACTS}/assert.log"
+  set +e
+  "${PW_PYTHON}" -B -S -P - "${run_stdout}" >"${assert_log}" 2>&1 <<'PY'
+import json, sys
+env = json.loads(open(sys.argv[1]).read())
+r = env["data"]["runner_result"]
+worker_pid = r["runner_subprocess"]["pid"]
+for s in r["steps"]:
+    sb_pid = s["sandbox_check"]["pid"]
+    assert sb_pid == worker_pid, \
+        "step {0}: sandbox_check.pid={1}, expected worker_pid={2}".format(s["step_id"], sb_pid, worker_pid)
+print("ok: sandbox_check.pid == worker_pid for both validator-backed and synthesized verdicts")
+PY
+  local arc=$?
+  set -e
+  if [[ "${arc}" -ne 0 ]]; then
+    local msg
+    msg="$(head -5 "${assert_log}" | tr '\n' ' ' | sed 's/"/\\"/g')"
+    test_fail "${msg}" "{\"log\":\"${assert_log}\",\"stdout\":\"${run_stdout}\"}"
+    return 0
+  fi
+  test_pass "sandbox_check.pid is the worker PID on both validator-backed and synthesized verdicts" "{\"stdout\":\"${run_stdout}\"}"
+}
+
+run_happy_default_allow
+run_bare_deny_default
+run_prediction_unavailable_pair
+# ---- test_id: access_failure_classified (PR I #2 regression) -------------
+#
+# A file/access attempt that fails with EPERM/EACCES used to land as
+# attempt.outcome="unsupported" because buildAttemptResult had no
+# case for attemptActionAccess. Post-fix the C worker's access(R_OK)
+# call is mapped to AttemptOutcome.accessFailed with the errno
+# preserved.
+
+run_access_failure_classified() {
+  local test_id="access_failure_classified"
+  test_selected "${test_id}" || return 0
+  test_begin "${PW_TEST_SUITE}" "${test_id}"
+  test_step "run" "(deny file-read-data /private/etc) + file/access on /etc/hosts → outcome=access_failed (was 'unsupported')"
+
+  if ! require_pw_app "${PW_BIN}"; then exit 0; fi
+
+  local specimen="${PW_TEST_ARTIFACTS}/specimen.json"
+  cat >"${specimen}" <<'EOF'
+{
+  "schema_version": 5,
+  "specimen_id": "use_c_worker_access_failed",
+  "policy": {"format": "sbpl", "sbpl_source": "(version 1)(allow default)(deny file-read-data (subpath \"/private/etc\"))"},
+  "probe_plan": [{
+    "step_id": "s_access",
+    "sandbox_check": {"operation": "file-read-data", "filter": {"kind": "path", "value": "/etc/hosts"}},
+    "attempt": {"kind": "file", "action": "access", "target": "/etc/hosts"}
+  }]
+}
+EOF
+
+  local run_stdout="${PW_TEST_ARTIFACTS}/run.json"
+  set +e
+  "${PW_BIN}" run "${specimen}" >"${run_stdout}" 2>/dev/null
+  set -e
+
+  local assert_log="${PW_TEST_ARTIFACTS}/assert.log"
+  set +e
+  "${PW_PYTHON}" -B -S -P - "${run_stdout}" >"${assert_log}" 2>&1 <<'PY'
+import json, sys
+env = json.loads(open(sys.argv[1]).read())
+r = env["data"]["runner_result"]
+s = r["steps"][0]
+# Attempt was access(R_OK) which the worker DOES run. It fails
+# because the deny rule covers /private/etc (canonical form of
+# /etc/hosts). Pre-fix the orchestrator surfaced this as
+# outcome=unsupported even though the syscall ran.
+assert s["attempt"]["outcome"] == "access_failed", \
+    "expected outcome=access_failed, got {0!r} (pre-fix this was 'unsupported')".format(s["attempt"]["outcome"])
+assert s["attempt"]["rc"] == 1
+# EPERM (1) or EACCES (13). The kernel sandbox kills the access
+# call; either errno is plausible across macOS revisions.
+assert s["attempt"]["errno"] in (1, 13), \
+    "expected EPERM/EACCES, got {0}".format(s["attempt"]["errno"])
+print("ok: file/access failure classified as access_failed (not unsupported)")
+PY
+  local arc=$?
+  set -e
+  if [[ "${arc}" -ne 0 ]]; then
+    local msg
+    msg="$(head -5 "${assert_log}" | tr '\n' ' ' | sed 's/"/\\"/g')"
+    test_fail "${msg}" "{\"log\":\"${assert_log}\",\"stdout\":\"${run_stdout}\"}"
+    return 0
+  fi
+  test_pass "file/access failure surfaces as access_failed with errno preserved" "{\"stdout\":\"${run_stdout}\"}"
+}
+
+# ---- test_id: exec_attempt_without_baseline_fails_cleanly ----------------
+#
+# Drives the wire+orchestrator integration for the new `exec` /
+# `spawn` attempt kind end-to-end. Under `(deny default)` with no
+# augment, posix_spawn is denied by the kernel sandbox; the
+# orchestrator must surface this as outcome=exec_failed with
+# child_pid==0 and errno∈{EPERM,EACCES}. That sentinel pair is the
+# clean "sandbox blocked spawn" tell — anything else (child_pid>0,
+# or a different errno, or a setup-failure error string) means the
+# resource-setup model has regressed and the witness is no longer
+# honest.
+#
+# Augmented-success coverage (an exec attempt that actually runs
+# under deny-default + the shipped exec_baseline augment) lands
+# alongside the empirical exec_baseline.sb in checkpoint 4.
+
+run_exec_attempt_without_baseline_fails_cleanly() {
+  local test_id="exec_attempt_without_baseline_fails_cleanly"
+  test_selected "${test_id}" || return 0
+  test_begin "${PW_TEST_SUITE}" "${test_id}"
+  test_step "run" "(deny default) + exec /usr/bin/true → exec_failed with child_pid=0, errno EPERM/EACCES from posix_spawn"
+
+  if ! require_pw_app "${PW_BIN}"; then exit 0; fi
+
+  local specimen="${PW_TEST_ARTIFACTS}/specimen.json"
+  cat >"${specimen}" <<'EOF'
+{
+  "schema_version": 5,
+  "specimen_id": "use_c_worker_exec_unaugmented",
+  "policy": {"format": "sbpl", "sbpl_source": "(version 1)(deny default)"},
+  "probe_plan": [{
+    "step_id": "s_exec",
+    "sandbox_check": {"operation": "process-exec*", "filter": {"kind": "path", "value": "/usr/bin/true"}},
+    "attempt": {"kind": "exec", "action": "spawn", "target": "/usr/bin/true"}
+  }]
+}
+EOF
+
+  local run_stdout="${PW_TEST_ARTIFACTS}/run.json"
+  set +e
+  "${PW_BIN}" run "${specimen}" >"${run_stdout}" 2>/dev/null
+  set -e
+
+  local assert_log="${PW_TEST_ARTIFACTS}/assert.log"
+  set +e
+  "${PW_PYTHON}" -B -S -P - "${run_stdout}" >"${assert_log}" 2>&1 <<'PY'
+import json, sys
+env = json.loads(open(sys.argv[1]).read())
+r = env["data"]["runner_result"]
+
+# Run itself completed cleanly — the worker spawned, applied the
+# policy, ran the attempt (which was denied), and exited.
+assert r["normalized_outcome"] == "ok", "outcome={0}".format(r["normalized_outcome"])
+assert r["runner_subprocess"]["exit_code"] == 0, \
+    "worker should clean-exit even when its attempt is denied"
+
+s = r["steps"][0]
+# Prediction channel: process-exec* + path is a working sandbox_check
+# invocation (the canonical SBPL operation name carries the star;
+# the unstar'd "process-exec" returns EINVAL from sandbox_check on
+# this macOS revision). The validator should predict deny against
+# (deny default).
+assert s["sandbox_check"]["outcome"] == "deny", \
+    "sandbox_check outcome={0!r} (validator should predict deny under deny-default)".format(
+        s["sandbox_check"]["outcome"])
+# Permission failure does not establish sandbox attribution: the record
+# observes the failure by errno and says nothing more.
+assert (s["comparison"]["observation"], s["comparison"]["observation_basis"]) == ("permission_failure", "permission_errno"), s["comparison"]
+
+a = s["attempt"]
+assert a["outcome"] == "exec_failed", \
+    "expected outcome=exec_failed, got {0!r}".format(a["outcome"])
+assert a["rc"] == -1, "spawn-failure rc sentinel: expected -1, got {0}".format(a["rc"])
+# THE LOAD-BEARING PIN: child_pid must be 0. If it's > 0, spawn
+# actually happened and the failure was the child's own exit code —
+# that would mean the worker's resource-setup model leaked
+# post-apply or the deny default policy isn't blocking spawn.
+assert a["child_pid"] == 0, \
+    "child_pid must be 0 when posix_spawn was blocked; got {0}".format(a["child_pid"])
+# EPERM (1) or EACCES (13) from posix_spawn. Anything else means
+# the failure came from a different source (e.g., a pre-spawn
+# setup syscall) — also a witness-honesty regression.
+assert a["errno"] in (1, 13), \
+    "expected EPERM/EACCES from posix_spawn; got errno={0}".format(a["errno"])
+# Error string should identify posix_spawn — pins the message
+# format so a future refactor can't silently move the failure
+# attribution.
+assert a.get("error") and "posix_spawn" in a["error"], \
+    "error should identify posix_spawn; got {0!r}".format(a.get("error"))
+# child_exit_code stays at the "no child ran" sentinel.
+assert a["child_exit_code"] == -1, \
+    "child_exit_code sentinel for spawn failure: expected -1, got {0}".format(a["child_exit_code"])
+assert a["child_term_signal"] == 0, \
+    "child_term_signal sentinel for spawn failure: expected 0, got {0}".format(a["child_term_signal"])
+
+print("ok: unaugmented exec fails cleanly via posix_spawn — child_pid=0, errno {0}".format(a["errno"]))
+PY
+  local arc=$?
+  set -e
+  if [[ "${arc}" -ne 0 ]]; then
+    local msg
+    msg="$(head -5 "${assert_log}" | tr '\n' ' ' | sed 's/"/\\"/g')"
+    test_fail "${msg}" "{\"log\":\"${assert_log}\",\"stdout\":\"${run_stdout}\"}"
+    return 0
+  fi
+  test_pass "unaugmented exec under (deny default) → posix_spawn EPERM/EACCES with child_pid=0" "{\"stdout\":\"${run_stdout}\"}"
+}
+
+# ---- test_id: exec_attempt_with_baseline_succeeds ------------------------
+#
+# Companion to exec_attempt_without_baseline_fails_cleanly. Same
+# (deny default) policy, but the caller opts into the shipped
+# `exec_baseline` augment. The controller splices the augment into
+# the caller's source; the worker compiles the spliced bytes and
+# posix_spawn now succeeds. Pins the user-facing contract that
+# `augments: ["exec_baseline"]` is sufficient to let a
+# libSystem-dynamic helper run under minimal-deny.
+#
+# Asserts:
+#   - normalized_outcome == "ok"
+#   - data.specimen.policy.augmentation applied == ["exec_baseline"],
+#     original_sha256 != applied_sha256
+#   - runner_result.policy_sha256 == applied_sha256
+#     (proves the runner compiled the spliced source, not the
+#     pre-splice source)
+#   - attempt.outcome == "ok" with child_pid > 0, child_exit_code == 0,
+#     stdout round-trips the helper's marker line
+
+run_exec_attempt_with_baseline_succeeds() {
+  local test_id="exec_attempt_with_baseline_succeeds"
+  test_selected "${test_id}" || return 0
+  test_begin "${PW_TEST_SUITE}" "${test_id}"
+  test_step "build" "compile exec_fixture/helper.c"
+  if ! require_pw_app "${PW_BIN}"; then exit 0; fi
+  if ! ensure_exec_fixture; then
+    test_skip "could not build exec_fixture helper (clang missing?)" \
+      "{\"src\":\"${EXEC_FIXTURE_SRC}\"}"
+    return 0
+  fi
+  test_step "run" "(deny default) + augments:[exec_baseline] + exec fixture helper → ok"
+
+  local specimen="${PW_TEST_ARTIFACTS}/specimen.json"
+  "${PW_PYTHON}" -B -S -P - "${specimen}" "${EXEC_FIXTURE_BIN}" <<'PY'
+import json, sys
+spec = {
+  "schema_version": 5,
+  "specimen_id": "use_c_worker_exec_baseline_succeeds",
+  "policy": {
+    "format": "sbpl",
+    "sbpl_source": "(version 1)\n(deny default)\n",
+    "augments": ["exec_baseline"],
+  },
+  "probe_plan": [{
+    "step_id": "s_exec",
+    "sandbox_check": {"operation": "process-exec*",
+                      "filter": {"kind": "path", "value": sys.argv[2]}},
+    "attempt": {"kind": "exec", "action": "spawn", "target": sys.argv[2]},
+  }],
+}
+open(sys.argv[1], "w").write(json.dumps(spec))
+PY
+
+  local run_stdout="${PW_TEST_ARTIFACTS}/run.json"
+  set +e
+  "${PW_BIN}" run "${specimen}" >"${run_stdout}" 2>/dev/null
+  set -e
+
+  local assert_log="${PW_TEST_ARTIFACTS}/assert.log"
+  set +e
+  "${PW_PYTHON}" -B -S -P - "${run_stdout}" >"${assert_log}" 2>&1 <<'PY'
+import json, sys
+env = json.loads(open(sys.argv[1]).read())
+assert env["result"]["normalized_outcome"] == "ok", \
+    "top-level outcome={0}".format(env["result"]["normalized_outcome"])
+
+aug = env["data"]["specimen"]["policy"]["augmentation"]
+assert aug["status"] == "applied", "augmentation status {0!r} on augmented run".format(aug["status"])
+assert aug["applied"] == ["exec_baseline"], \
+    "applied={0!r}".format(aug["applied"])
+assert aug["original_sha256"] != aug["applied_sha256"], \
+    "hashes should differ when augment splices content"
+
+r = env["data"]["runner_result"]
+assert r["policy_sha256"] == aug["applied_sha256"], \
+    "runner_result.policy_sha256 ({0}) != applied_sha256 ({1}) — runner did not compile spliced source".format(
+        r["policy_sha256"], aug["applied_sha256"])
+
+s = r["steps"][0]
+# Prediction channel: validator must predict allow against the
+# spliced (deny default) + exec_baseline policy. Pins that the
+# validator (a) accepts process-exec* + path and (b) sees the
+# spliced policy, not the pre-splice source. This compares execution admission
+# for the submitted target, not all prerequisites of posix_spawn.
+assert s["sandbox_check"]["outcome"] == "allow", \
+    "sandbox_check should predict allow when augment grants process-exec*; got {0!r}".format(
+        s["sandbox_check"]["outcome"])
+assert s["comparison"]["observation"] == "succeeded" and s["comparison"]["observation_basis"] == "spawned_child", \
+    "allowed target admission beside an observed spawn; got {0!r}".format(s["comparison"])
+
+a = s["attempt"]
+assert a["outcome"] == "ok", "attempt outcome={0}".format(a["outcome"])
+assert a["rc"] == 0, "attempt rc={0}".format(a["rc"])
+assert a["child_pid"] > 0, "child_pid={0} (spawn should have produced a child)".format(a["child_pid"])
+assert a["child_exit_code"] == 0, "child_exit_code={0}".format(a["child_exit_code"])
+assert a["child_term_signal"] == 0, "child_term_signal={0}".format(a["child_term_signal"])
+assert a.get("stdout") == "exec_fixture: hello from helper\n", \
+    "stdout round-trip mismatch: {0!r}".format(a.get("stdout"))
+assert a.get("stderr") is None, "stderr={0!r}".format(a.get("stderr"))
+
+print("ok: augmented exec under (deny default) reached ok via exec_baseline; prediction agrees")
+PY
+  local arc=$?
+  set -e
+  if [[ "${arc}" -ne 0 ]]; then
+    local msg
+    msg="$(head -5 "${assert_log}" | tr '\n' ' ' | sed 's/"/\\"/g')"
+    test_fail "${msg}" "{\"log\":\"${assert_log}\",\"stdout\":\"${run_stdout}\"}"
+    return 0
+  fi
+  test_pass "augmented exec under (deny default) reached ok via exec_baseline" \
+    "{\"stdout\":\"${run_stdout}\"}"
+}
+
+# ---- test_id: exec_attempt_args_and_stderr_round_trip --------------------
+#
+# Drives the shared fixture with a nonzero exit followed by a successful exec.
+# Both retain output and their requested exit status; the nonzero exit does
+# not abort the plan or become evidence of sandbox denial.
+
+run_exec_attempt_args_and_stderr_round_trip() {
+  local test_id="exec_attempt_args_and_stderr_round_trip"
+  test_selected "${test_id}" || return 0
+  test_begin "${PW_TEST_SUITE}" "${test_id}"
+  if ! require_pw_app "${PW_BIN}"; then exit 0; fi
+  if ! ensure_exec_fixture; then
+    test_skip "could not build exec_fixture helper" \
+      "{\"src\":\"${EXEC_FIXTURE_SRC}\"}"
+    return 0
+  fi
+  test_step "run" "exec helper exits 37 then 0; both retain output and the plan continues"
+
+  local specimen="${PW_TEST_ARTIFACTS}/specimen.json"
+  "${PW_PYTHON}" -B -S -P - "${specimen}" "${EXEC_FIXTURE_BIN}" <<'PY'
+import json, secrets, sys
+spec = {
+  "schema_version": 5,
+  "specimen_id": "use_c_worker_exec_args_stderr",
+  "policy": {
+    "format": "sbpl",
+    "sbpl_source": "(version 1)\n(deny default)\n",
+    "augments": ["exec_baseline"],
+  },
+  "probe_plan": [{
+    "step_id": "s_exec_exit_" + str(status),
+    "sandbox_check": {"operation": "process-exec*",
+                      "filter": {"kind": "path", "value": sys.argv[2]}},
+    "attempt": {"kind": "exec", "action": "spawn", "target": sys.argv[2],
+                "args": ["--stderr", secrets.token_hex(16), "--exit", str(status)]},
+  } for status in (37, 0)],
+}
+open(sys.argv[1], "w").write(json.dumps(spec))
+PY
+
+  local run_stdout="${PW_TEST_ARTIFACTS}/run.json"
+  set +e
+  "${PW_BIN}" run "${specimen}" >"${run_stdout}" 2>/dev/null
+  local rc=$?
+  set -e
+  if [[ "${rc}" -ne 0 ]]; then
+    test_fail "nonzero exec exit aborted the specimen (CLI rc=${rc})"
+  fi
+
+  local assert_log="${PW_TEST_ARTIFACTS}/assert.log"
+  set +e
+  "${PW_PYTHON}" -B -S -P - "${run_stdout}" "${specimen}" >"${assert_log}" 2>&1 <<'PY'
+import json, sys
+env = json.loads(open(sys.argv[1]).read())
+plan = json.loads(open(sys.argv[2]).read())["probe_plan"]
+runner = env["data"]["runner_result"]
+assert env["result"]["ok"] is True and runner["normalized_outcome"] == "ok"
+assert runner.get("test_overrides") is None
+assert [s["step_id"] for s in runner["steps"]] == [p["step_id"] for p in plan]
+for s, request in zip(runner["steps"], plan):
+    args = request["attempt"]["args"]
+    status = int(args[3])
+    assert s["sandbox_check"]["outcome"] == "allow", s
+    assert s["comparison"]["observation_basis"] == "spawned_child", s  # the spawn is the observation
+    a = s["attempt"]
+    assert a["outcome"] == ("exec_failed" if status else "ok"), a
+    assert a["rc"] == status, a
+    assert a["child_pid"] > 0 and a["child_term_signal"] == 0, a
+    assert a["child_exit_code"] == status, a
+    assert a["stdout"] == "exec_fixture: hello from helper\n", a
+    assert a["stderr"] == args[1] + "\n", a
+print("ok: nonzero and successful exits retain both streams and status; plan continues")
+PY
+  local arc=$?
+  set -e
+  if [[ "${arc}" -ne 0 ]]; then
+    local msg
+    msg="$(head -5 "${assert_log}" | tr '\n' ' ' | sed 's/"/\\"/g')"
+    test_fail "${msg}" "{\"log\":\"${assert_log}\",\"stdout\":\"${run_stdout}\"}"
+    return 0
+  fi
+  test_pass "exec args, output, and nonzero status survive; the following exec completes" \
+    "{\"stdout\":\"${run_stdout}\"}"
+}
+
+# ---- test_id: exec_attempt_stdout_truncation_marker ----------------------
+#
+# Helper writes more bytes to stdout than the slot can hold
+# (PW_SHM_CHILD_OUTPUT_BYTES = 1024). The worker must truncate AND
+# append the "... [truncated]" marker so a consumer can tell the
+# output was capped.
+
+run_exec_attempt_stdout_truncation_marker() {
+  local test_id="exec_attempt_stdout_truncation_marker"
+  test_selected "${test_id}" || return 0
+  test_begin "${PW_TEST_SUITE}" "${test_id}"
+  if ! require_pw_app "${PW_BIN}"; then exit 0; fi
+  if ! ensure_exec_fixture; then
+    test_skip "could not build exec_fixture helper" \
+      "{\"src\":\"${EXEC_FIXTURE_SRC}\"}"
+    return 0
+  fi
+  test_step "run" "exec helper --stdout-bytes 4096 → captured up to 1023 bytes with truncation marker"
+
+  local specimen="${PW_TEST_ARTIFACTS}/specimen.json"
+  "${PW_PYTHON}" -B -S -P - "${specimen}" "${EXEC_FIXTURE_BIN}" <<'PY'
+import json, sys
+spec = {
+  "schema_version": 5,
+  "specimen_id": "use_c_worker_exec_truncation",
+  "policy": {
+    "format": "sbpl",
+    "sbpl_source": "(version 1)\n(deny default)\n",
+    "augments": ["exec_baseline"],
+  },
+  "probe_plan": [{
+    "step_id": "s_exec_trunc",
+    "sandbox_check": {"operation": "process-exec*",
+                      "filter": {"kind": "path", "value": sys.argv[2]}},
+    "attempt": {"kind": "exec", "action": "spawn", "target": sys.argv[2],
+                "args": ["--stdout-bytes", "4096"]},
+  }],
+}
+open(sys.argv[1], "w").write(json.dumps(spec))
+PY
+
+  local run_stdout="${PW_TEST_ARTIFACTS}/run.json"
+  set +e
+  "${PW_BIN}" run "${specimen}" >"${run_stdout}" 2>/dev/null
+  set -e
+
+  local assert_log="${PW_TEST_ARTIFACTS}/assert.log"
+  set +e
+  "${PW_PYTHON}" -B -S -P - "${run_stdout}" >"${assert_log}" 2>&1 <<'PY'
+import json, sys
+env = json.loads(open(sys.argv[1]).read())
+s = env["data"]["runner_result"]["steps"][0]
+assert s["sandbox_check"]["outcome"] == "allow"
+assert s["comparison"]["observation_basis"] == "spawned_child"  # the spawn is the observation
+a = s["attempt"]
+assert a["outcome"] == "ok", "outcome={0}".format(a["outcome"])
+out = a.get("stdout") or ""
+# Buffer is PW_SHM_CHILD_OUTPUT_BYTES (1024); reader is 1023 bytes + NUL.
+# Truncation marker eats the tail: "\n... [truncated]" is 16 bytes.
+assert len(out) > 0, "stdout should not be empty"
+assert len(out) < 1024, "stdout {0} bytes should fit in the slot buffer".format(len(out))
+assert "[truncated]" in out, "truncation marker missing from captured stdout (len={0})".format(len(out))
+# Body should be 'A' fill before the marker.
+body = out.split("\n... [truncated]")[0]
+assert set(body) == {"A"}, "body should be 'A' fill, got chars {0!r}".format(set(body))
+print("ok: stdout truncated to {0} bytes with marker; body is 'A' fill".format(len(out)))
+PY
+  local arc=$?
+  set -e
+  if [[ "${arc}" -ne 0 ]]; then
+    local msg
+    msg="$(head -5 "${assert_log}" | tr '\n' ' ' | sed 's/"/\\"/g')"
+    test_fail "${msg}" "{\"log\":\"${assert_log}\",\"stdout\":\"${run_stdout}\"}"
+    return 0
+  fi
+  test_pass "oversized stdout truncated with [truncated] marker" \
+    "{\"stdout\":\"${run_stdout}\"}"
+}
+
+# ---- test_id: sandbox_check_unsupported_operation_diagnostic -------------
+#
+# Reporter's repro: a probe step whose sandbox_check.operation is a
+# bare name libsandbox doesn't accept (e.g. "process-exec" instead
+# of the canonical "process-exec*") produced outcome=error with
+# error=null pre-fix — a silent diagnostic loss. After the fix the
+# step surfaces a distinct outcome ("unsupported_operation") with a
+# populated error string that names the rejected operation and
+# hints at the wildcard form. The record claims no order, and the cause
+# is documented by the outcome rather than mysteriously absent.
+#
+# Two-step specimen: a bare process-exec step + a star process-exec*
+# step exercise the asymmetry in one run. Both attempts run cleanly
+# (the issue is on the prediction channel only).
+
+run_sandbox_check_unsupported_operation_diagnostic() {
+  local test_id="sandbox_check_unsupported_operation_diagnostic"
+  test_selected "${test_id}" || return 0
+  test_begin "${PW_TEST_SUITE}" "${test_id}"
+  test_step "run" "bare process-exec → outcome=unsupported_operation with diagnostic; star process-exec* → outcome=allow"
+  if ! require_pw_app "${PW_BIN}"; then exit 0; fi
+
+  local specimen="${PW_TEST_ARTIFACTS}/specimen.json"
+  cat >"${specimen}" <<'EOF'
+{
+  "schema_version": 5,
+  "specimen_id": "unsupported_operation_repro",
+  "policy": {"format": "sbpl", "sbpl_source": "(version 1) (allow default)"},
+  "probe_plan": [
+    {
+      "step_id": "bare",
+      "sandbox_check": {"operation": "process-exec", "filter": {"kind": "none"}},
+      "attempt": {"kind": "sysctl", "action": "read", "target": "kern.osrelease"}
+    },
+    {
+      "step_id": "wild",
+      "sandbox_check": {"operation": "process-exec*", "filter": {"kind": "none"}},
+      "attempt": {"kind": "sysctl", "action": "read", "target": "kern.osrelease"}
+    }
+  ]
+}
+EOF
+
+  local run_stdout="${PW_TEST_ARTIFACTS}/run.json"
+  set +e
+  "${PW_BIN}" run "${specimen}" >"${run_stdout}" 2>/dev/null
+  set -e
+
+  local assert_log="${PW_TEST_ARTIFACTS}/assert.log"
+  set +e
+  "${PW_PYTHON}" -B -S -P - "${run_stdout}" >"${assert_log}" 2>&1 <<'PY'
+import json, sys
+env = json.loads(open(sys.argv[1]).read())
+r = env["data"]["runner_result"]
+assert r["normalized_outcome"] == "ok", "top-level outcome={0}".format(r["normalized_outcome"])
+
+steps = {s["step_id"]: s for s in r["steps"]}
+assert set(steps) == {"bare", "wild"}, "unexpected step ids: {0}".format(set(steps))
+
+# Bare step: distinct outcome + populated error + no order claim.
+bare = steps["bare"]
+bc = bare["sandbox_check"]
+assert bc["outcome"] == "unsupported_operation", \
+    "bare process-exec expected outcome=unsupported_operation; got {0!r} — diagnostic-loss regression".format(
+        bc["outcome"])
+assert bc.get("error"), \
+    "bare step's sandbox_check.error must be populated (the whole point of this case); got {0!r}".format(
+        bc.get("error"))
+assert "process-exec" in bc["error"], \
+    "error should name the rejected operation; got {0!r}".format(bc["error"])
+assert "wildcard" in bc["error"], \
+    "error should hint at the wildcard convention; got {0!r}".format(bc["error"])
+# rc is the validator's reported value: -1 for the EINVAL path.
+assert bc.get("rc") == -1, "bare sandbox_check rc expected -1; got {0!r}".format(bc.get("rc"))
+assert bc.get("errno") == 22, "bare sandbox_check errno expected 22 (EINVAL); got {0!r}".format(bc.get("errno"))
+# No allow/deny verdict exists, so the record claims no order; the
+# outcome explains why instead of a silently absent field. The bare spelling
+# is not the exec attempt's mapped operation (process-exec*), so the record
+# reports a different submitted operation rather than an unresolved one.
+assert bare["comparison"]["order"] == "unestablished", bare["comparison"]
+assert bare["comparison"]["operation_relation"] == "different", bare["comparison"]
+assert bare["comparison"]["limitations"] == [], bare["comparison"]
+# The attempt still ran cleanly (the issue was only on the prediction channel).
+assert bare["attempt"]["outcome"] == "ok", \
+    "bare attempt should have run cleanly; got {0!r}".format(bare["attempt"]["outcome"])
+
+# Wild step: unchanged shape, validator + attempt agree on allow.
+wild = steps["wild"]
+assert wild["sandbox_check"]["outcome"] == "allow", \
+    "wild process-exec* expected outcome=allow; got {0!r}".format(wild["sandbox_check"]["outcome"])
+assert wild["sandbox_check"].get("error") is None, \
+    "wild sandbox_check.error should be null on allow; got {0!r}".format(wild["sandbox_check"].get("error"))
+assert wild["comparison"]["operation_relation"] == "unresolved", \
+    "broad query has unresolved operation scope; got {0!r}".format(wild["comparison"])
+assert wild["attempt"]["outcome"] == "ok"
+
+print("ok: bare process-exec → unsupported_operation with diagnostic; wild process-exec* → allow")
+PY
+  local arc=$?
+  set -e
+  if [[ "${arc}" -ne 0 ]]; then
+    local msg
+    msg="$(head -5 "${assert_log}" | tr '\n' ' ' | sed 's/"/\\"/g')"
+    test_fail "${msg}" "{\"log\":\"${assert_log}\",\"stdout\":\"${run_stdout}\"}"
+    return 0
+  fi
+  test_pass "bare check operation surfaces as unsupported_operation with populated diagnostic" \
+    "{\"stdout\":\"${run_stdout}\"}"
+}
+
+# ---- test_id: sandbox_check_path_unresolved_prediction_unavailable -------
+#
+# Per-step host condition: a path-filter target that doesn't
+# resolve on the host short-circuits to prediction_unavailable.
+# The kernel ENOENTs file-* access before reaching the sandbox
+# layer for absent paths, so libsandbox's verdict for such a path
+# is a userland canonicalization artifact — surfacing it as
+# "deny" would mislead consumers that filter on outcome to detect
+# real kernel-side denials.
+#
+# Reporter's repro shape: one resolvable + one unresolvable path
+# under the same allow rule. The resolvable step's verdict is
+# unchanged; the unresolvable step is now prediction_unavailable
+# with the gate's reason populated in `error`. The record names the
+# planning exclusion and claims no order; the cause is self-documented
+# by the outcome rather than silently undefined.
+
+run_sandbox_check_path_unresolved_prediction_unavailable() {
+  local test_id="sandbox_check_path_unresolved_prediction_unavailable"
+  test_selected "${test_id}" || return 0
+  test_begin "${PW_TEST_SUITE}" "${test_id}"
+  test_step "run" "resolvable path → unchanged; unresolvable path → prediction_unavailable with populated error"
+  if ! require_pw_app "${PW_BIN}"; then exit 0; fi
+
+  local specimen="${PW_TEST_ARTIFACTS}/specimen.json"
+  cat >"${specimen}" <<'EOF'
+{
+  "schema_version": 5,
+  "specimen_id": "path_unresolved_repro",
+  "policy": {
+    "format": "sbpl",
+    "sbpl_source": "(version 1)\n(deny default)\n(allow file-read-data (subpath \"/usr/lib\"))\n"
+  },
+  "probe_plan": [
+    {
+      "step_id": "exists",
+      "sandbox_check": {"operation": "file-read-data", "filter": {"kind": "path", "value": "/usr/lib/dyld"}},
+      "attempt": {"kind": "file", "action": "open_read", "target": "/usr/lib/dyld"}
+    },
+    {
+      "step_id": "absent",
+      "sandbox_check": {"operation": "file-read-data", "filter": {"kind": "path", "value": "/usr/lib/NONEXISTENT_pw_repro"}},
+      "attempt": {"kind": "file", "action": "open_read", "target": "/usr/lib/NONEXISTENT_pw_repro"}
+    }
+  ]
+}
+EOF
+
+  local run_stdout="${PW_TEST_ARTIFACTS}/run.json"
+  set +e
+  "${PW_BIN}" run "${specimen}" >"${run_stdout}" 2>/dev/null
+  set -e
+
+  local assert_log="${PW_TEST_ARTIFACTS}/assert.log"
+  set +e
+  "${PW_PYTHON}" -B -S -P - "${run_stdout}" >"${assert_log}" 2>&1 <<'PY'
+import json, sys
+env = json.loads(open(sys.argv[1]).read())
+r = env["data"]["runner_result"]
+assert r["normalized_outcome"] == "ok", "top-level outcome={0}".format(r["normalized_outcome"])
+steps = {s["step_id"]: s for s in r["steps"]}
+assert set(steps) == {"exists", "absent"}, "unexpected step ids: {0}".format(set(steps))
+
+# Resolvable step: validator runs, allow, attempt ok, succeeded record.
+ex = steps["exists"]
+assert ex["sandbox_check"]["outcome"] == "allow", \
+    "resolvable path expected sb_check=allow; got {0!r}".format(ex["sandbox_check"]["outcome"])
+assert ex["sandbox_check"].get("filter_type_id") is not None, \
+    "resolvable path should carry a filter_type_id (proves validator ran); got {0!r}".format(
+        ex["sandbox_check"].get("filter_type_id"))
+assert ex["comparison"]["observation"] == "succeeded" and ex["comparison"]["order"] == "query_first", ex["comparison"]
+assert ex["attempt"]["outcome"] == "ok"
+
+# Unresolvable step: validator skipped, prediction_unavailable +
+# rc sentinel + populated error + filter_type_id null + planning limitation.
+ab = steps["absent"]
+sb = ab["sandbox_check"]
+assert sb["outcome"] == "prediction_unavailable", \
+    "absent path expected prediction_unavailable; got {0!r} (silent diagnostic regression)".format(sb["outcome"])
+assert sb["rc"] == -1, "prediction_unavailable rc sentinel: expected -1; got {0!r}".format(sb["rc"])
+assert sb.get("filter_type_id") is None, \
+    "validator must not have been asked; expected filter_type_id=null, got {0!r}".format(sb.get("filter_type_id"))
+err = sb.get("error") or ""
+assert err, "prediction_unavailable.error must be populated for the path-unresolved gate; got {0!r}".format(err)
+assert "/usr/lib/NONEXISTENT_pw_repro" in err, \
+    "error must name the unresolved path; got {0!r}".format(err)
+assert "did not resolve" in err, "error should explain the gate reason; got {0!r}".format(err)
+assert ab["comparison"]["order"] == "unestablished", ab["comparison"]
+assert ab["comparison"]["limitations"] == ["query_plan:path_unresolved_at_planning"], ab["comparison"]
+# Attempt still runs and carries the real evidence — the kernel
+# ENOENT comes through as open_failed with errno=2.
+assert ab["attempt"]["outcome"] == "open_failed"
+assert ab["attempt"].get("errno") == 2, \
+    "attempt errno expected 2 (ENOENT); got {0!r}".format(ab["attempt"].get("errno"))
+
+# path_diagnostics enrichment still runs for both steps — consumers
+# can see realpath_resolved=null for the absent path as a second
+# tell about WHY the gate fired.
+ab_diag = sb.get("path_diagnostics") or {}
+assert "realpath_resolved" not in (ab_diag.get("same_as_input") or []) and \
+    "realpath_resolved" in ab_diag and ab_diag["realpath_resolved"] is None, \
+    "absent path's realpath_resolved should be an explicit null; got {0!r}".format(ab_diag)
+
+print("ok: resolvable path unchanged; absent path → prediction_unavailable with populated reason")
+PY
+  local arc=$?
+  set -e
+  if [[ "${arc}" -ne 0 ]]; then
+    local msg
+    msg="$(head -5 "${assert_log}" | tr '\n' ' ' | sed 's/"/\\"/g')"
+    test_fail "${msg}" "{\"log\":\"${assert_log}\",\"stdout\":\"${run_stdout}\"}"
+    return 0
+  fi
+  test_pass "path filter unresolved → prediction_unavailable with populated diagnostic" \
+    "{\"stdout\":\"${run_stdout}\"}"
+}
+
+run_duplicate_step_id_rejected
+run_unsupported_attempt_rejected
+run_worker_timeout_ms_honored
+run_sandbox_check_pid_matches_worker
+run_access_failure_classified
+run_exec_attempt_without_baseline_fails_cleanly
+run_exec_attempt_with_baseline_succeeds
+run_exec_attempt_args_and_stderr_round_trip
+run_exec_attempt_stdout_truncation_marker
+run_sandbox_check_unsupported_operation_diagnostic
+run_sandbox_check_path_unresolved_prediction_unavailable

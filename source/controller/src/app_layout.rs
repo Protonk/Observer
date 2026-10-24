@@ -1,0 +1,103 @@
+//! Bundle layout for PolicyWitness.app.
+//!
+//! The controller resolves embedded tools relative to its own executable so the
+//! app bundle can be relocated without rewriting paths. The built-in runner and
+//! the three binary baselines are selected by the fixed relative paths below,
+//! through the app evidence manifest; no Info.plist is read on a run.
+
+use std::path::{Component, Path, PathBuf};
+
+/// A binary the app ships at a fixed path, selected and compared by that path.
+pub struct ShippedBinary {
+    /// Path relative to the app root.
+    pub rel_path: &'static str,
+    /// The manifest `kind` the entry at that path must carry.
+    pub kind: &'static str,
+}
+
+/// The built-in XPC service host.
+pub const SHIPPED_SERVICE: ShippedBinary = ShippedBinary {
+    rel_path: "Contents/XPCServices/PWRunner.xpc/Contents/MacOS/PWRunner",
+    kind: "xpc-service",
+};
+/// The bundle-local C worker.
+pub const SHIPPED_WORKER: ShippedBinary = ShippedBinary {
+    rel_path: "Contents/XPCServices/PWRunner.xpc/Contents/MacOS/pw-probe-runner",
+    kind: "xpc-embedded-helper",
+};
+/// The bundle-local validator used by default; an explicit override is separate.
+pub const SHIPPED_VALIDATOR: ShippedBinary = ShippedBinary {
+    rel_path: "Contents/XPCServices/PWRunner.xpc/Contents/MacOS/sb_api_validator",
+    kind: "xpc-embedded-helper",
+};
+
+/// The worker and validator inside any XPC service bundle, relative to the
+/// bundle root: the host resolves them at these paths relative to its own
+/// bundle, and the installer signs and reads them back at the same paths.
+pub const BUNDLE_WORKER_REL: &str = "Contents/MacOS/pw-probe-runner";
+pub const BUNDLE_VALIDATOR_REL: &str = "Contents/MacOS/sb_api_validator";
+pub const BUNDLE_ISSUER_REL: &str = "Contents/MacOS/pw-extension-issuer";
+pub const SHIPPED_ISSUER: ShippedBinary = ShippedBinary {
+    rel_path: "Contents/XPCServices/PWRunner.xpc/Contents/MacOS/pw-extension-issuer",
+    kind: "xpc-embedded-helper",
+};
+/// The directory both live in, for checks on recorded executable paths.
+pub const BUNDLE_MACOS_REL: &str = "Contents/MacOS";
+
+fn validate_tool_name(tool_name: &str) -> Result<(), String> {
+    let mut components = Path::new(tool_name).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(()),
+        _ => Err(format!(
+            "invalid tool name {tool_name:?} (must be a single path component)"
+        )),
+    }
+}
+
+pub fn app_root_from_current_exe() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe() failed: {e}"))?;
+    // Expected layout: dist/PolicyWitness.app/Contents/MacOS/policy-witness
+    let contents_dir = exe
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| format!("unexpected executable location: {}", exe.display()))?;
+    let app_root = contents_dir
+        .parent()
+        .ok_or_else(|| format!("unexpected executable location: {}", exe.display()))?;
+    Ok(app_root.to_path_buf())
+}
+
+pub fn resolve_contents_macos_tool(tool_name: &str) -> Result<PathBuf, String> {
+    validate_tool_name(tool_name)?;
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe() failed: {e}"))?;
+    let contents_dir = exe
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| format!("unexpected executable location: {}", exe.display()))?;
+    // Tools live alongside the controller under Contents/MacOS.
+    let candidate = contents_dir.join("MacOS").join(tool_name);
+    if candidate.exists() {
+        return Ok(candidate);
+    }
+    Err(format!(
+        "embedded tool not found in Contents/MacOS: {tool_name:?} (expected: {})",
+        candidate.display()
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundle_relative_helper_paths_agree_with_the_shipped_layout() {
+        for (bundle_rel, shipped) in [
+            (BUNDLE_WORKER_REL, &SHIPPED_WORKER),
+            (BUNDLE_VALIDATOR_REL, &SHIPPED_VALIDATOR),
+            (BUNDLE_ISSUER_REL, &SHIPPED_ISSUER),
+        ] {
+            let expected = format!("Contents/XPCServices/PWRunner.xpc/{bundle_rel}");
+            assert_eq!(shipped.rel_path, expected);
+        }
+    }
+}

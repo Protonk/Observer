@@ -1,0 +1,307 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Layout-drift guard for the host↔worker shm ABI.
+#
+# Compiles a small C printer against the C ABI header at test time,
+# runs it to harvest sizeof / offsetof / constant values, then parses
+# the Swift PWShmLayout enum that mirrors those constants on the host
+# side. Every printer line must map to a PWShmLayout constant with the
+# identical numeric value; every PWShmLayout constant must have a
+# corresponding printer line.
+#
+# This catches a class of bug that parser-only source_drift cannot:
+# compiler-applied struct padding can shift a Swift-mirrored offset
+# out of agreement with the C side without the textual constants in
+# the header changing at all. The printer's offsetof() values are
+# ground truth.
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+source "${ROOT_DIR}/tests/lib/testlib.sh"
+
+PW_TEST_SUITE="runner_abi_layout"
+SUITE_DIR="${ROOT_DIR}/tests/suites/runner_abi_layout"
+ABI_HEADER_DIR="${ROOT_DIR}/controller/tools/pw_probe_runner"
+SWIFT_LAYOUT_FILE="${ROOT_DIR}/runner/Sources/PWRunnerCore/CWorker.swift"
+
+# ----------------------------------------------------------------------
+# Case 1: c_swift_layout_agreement
+# ----------------------------------------------------------------------
+PW_TEST_ID="c_swift_layout_agreement"
+test_begin "${PW_TEST_SUITE}" "${PW_TEST_ID}"
+test_step "build" "compile printer against pw_probe_runner_abi.h"
+
+require_clang || exit 0
+require_macos_sdk || exit 0
+
+PRINTER_BIN="${PW_TEST_ARTIFACTS}/printer"
+PRINTER_OUT="${PW_TEST_ARTIFACTS}/printer.out"
+PRINTER_ERR="${PW_TEST_ARTIFACTS}/printer.err"
+
+if ! /usr/bin/xcrun --sdk macosx clang -Wall -Wextra -O2 -std=c11 \
+       -I "${ABI_HEADER_DIR}" \
+       -o "${PRINTER_BIN}" \
+       "${SUITE_DIR}/printer.c" 2>"${PRINTER_ERR}"; then
+  test_fail "printer.c failed to compile against pw_probe_runner_abi.h" \
+    "{\"compile_error_log\":\"${PRINTER_ERR}\"}"
+fi
+
+test_step "run" "harvest sizeof / offsetof from C-side printer"
+
+if ! "${PRINTER_BIN}" >"${PRINTER_OUT}" 2>>"${PRINTER_ERR}"; then
+  test_fail "printer execution failed" \
+    "{\"stderr_log\":\"${PRINTER_ERR}\",\"stdout_log\":\"${PRINTER_OUT}\"}"
+fi
+
+test_step "compare" "diff printer output against Swift PWShmLayout"
+
+DIFF_REPORT="${PW_TEST_ARTIFACTS}/diff.json"
+if ! PW_PRINTER_OUT="${PRINTER_OUT}" \
+     PW_SWIFT_LAYOUT_FILE="${SWIFT_LAYOUT_FILE}" \
+     PW_DIFF_REPORT="${DIFF_REPORT}" \
+     PW_ABI_GOLDEN="${ROOT_DIR}/tests/fixtures/contract/abi_layout.txt" \
+     PW_ABI_GOLDEN_CANDIDATE="${PW_TEST_ARTIFACTS}/abi_layout.candidate.txt" \
+     PW_TESTS_LIB="${ROOT_DIR}/tests/lib" \
+     "${PW_PYTHON}" -B -S -P - 2>"${PW_TEST_ARTIFACTS}/layout-check.err" <<'PY'
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+printer_out = Path(os.environ["PW_PRINTER_OUT"]).read_text(encoding="utf-8")
+swift_text = Path(os.environ["PW_SWIFT_LAYOUT_FILE"]).read_text(encoding="utf-8")
+diff_report = Path(os.environ["PW_DIFF_REPORT"])
+
+
+def to_camel(snake: str) -> str:
+    parts = snake.lower().split("_")
+    return parts[0] + "".join(p.capitalize() for p in parts[1:])
+
+
+def title_first(s: str) -> str:
+    return (s[0].upper() + s[1:]) if s else s
+
+
+# Map each printer key to the PWShmLayout constant name we expect to
+# find in CWorker.swift. The mapping is mechanical and bidirectional —
+# adding a new printer line that maps to a name not in this table will
+# raise, forcing the table to stay current as the layout grows.
+def swift_name_for(printer_key: str) -> str:
+    if printer_key.startswith("PW_SHM_"):
+        return to_camel(printer_key[len("PW_SHM_"):])
+    if printer_key == "sizeof.pw_shm_header_t":
+        return "headerBytes"
+    if printer_key == "sizeof.pw_shm_slot_t":
+        return "slotBytes"
+    if printer_key == "sizeof.pw_shm_param_t":
+        return "paramBytes"
+    if printer_key == "sizeof.pw_shm_evidence_t":
+        return "evidenceHeaderBytes"
+    if printer_key == "region.evidence_offset":
+        return "evidenceOffset"
+    if printer_key.startswith("offsetof.pw_shm_evidence_t."):
+        field = printer_key[len("offsetof.pw_shm_evidence_t."):]
+        return "evidence" + title_first(to_camel(field)) + "Offset"
+    if printer_key == "sizeof.pw_shm_capture_t":
+        return "captureHeaderBytes"
+    if printer_key.startswith("offsetof.pw_shm_capture_t."):
+        field = printer_key[len("offsetof.pw_shm_capture_t."):]
+        return "capture" + title_first(to_camel(field)) + "Offset"
+    if printer_key == "sizeof.pw_shm_phase_t":
+        return "phaseBytes"
+    if printer_key == "offsetof.pw_shm_header_t.phases":
+        return "phaseRecordsOffset"
+    if printer_key.startswith("offsetof.pw_shm_phase_t."):
+        field = printer_key[len("offsetof.pw_shm_phase_t."):]
+        return "phase" + title_first(to_camel(field)) + "Offset"
+    if printer_key.startswith("offsetof.pw_shm_header_t."):
+        field = printer_key[len("offsetof.pw_shm_header_t."):]
+        return to_camel(field) + "Offset"
+    if printer_key.startswith("offsetof.pw_shm_slot_t."):
+        field = printer_key[len("offsetof.pw_shm_slot_t."):]
+        return "slot" + title_first(to_camel(field)) + "Offset"
+    if printer_key.startswith("offsetof.pw_shm_param_t."):
+        field = printer_key[len("offsetof.pw_shm_param_t."):]
+        return "param" + title_first(to_camel(field)) + "Offset"
+    if printer_key == "region.slots_offset":
+        return "slotsOffset"
+    if printer_key == "region.params_offset":
+        return "paramsOffset"
+    if printer_key == "region.capture_offset":
+        return "captureOffset"
+    raise SystemExit(
+        f"no Swift mapping defined for printer key {printer_key!r}; "
+        "update swift_name_for() in tests/suites/runner_abi_layout/run.sh"
+    )
+
+
+printer_values: dict[str, int] = {}
+compiled_identity = None
+for line in printer_out.splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    if "=" not in line:
+        raise SystemExit(f"malformed printer line (no '='): {line!r}")
+    key, value = line.split("=", 1)
+    if key == "PW_WORKER_ABI_IDENTITY":
+        compiled_identity = value
+        continue
+    try:
+        printer_values[key] = int(value)
+    except ValueError as e:
+        raise SystemExit(f"non-integer printer value: {line!r} ({e})")
+
+sys.path.insert(0, os.environ["PW_TESTS_LIB"])
+from contract import WORKER_IDENTITY
+swift_identity = re.search(r'(?:public\s+)?static let abiIdentityHex = "([0-9a-f]{64})"', swift_text)
+if not swift_identity or compiled_identity != swift_identity.group(1) or compiled_identity != WORKER_IDENTITY:
+    raise SystemExit("compiled C identity, Swift identity and generated Python identity disagree")
+
+# Only geometry belongs in the layout golden. Source identity changes are
+# automatic and do not create another manual golden update obligation.
+layout_text = ''.join(line + '\n' for line in printer_out.splitlines()
+                      if not line.startswith('PW_WORKER_ABI_IDENTITY='))
+from abi_golden import compare
+golden_path = Path(os.environ["PW_ABI_GOLDEN"])
+golden_text = golden_path.read_text(encoding="utf-8") if golden_path.exists() else ""
+status, detail = compare(layout_text, golden_text)
+if status != "ok":
+    candidate = Path(os.environ["PW_ABI_GOLDEN_CANDIDATE"])
+    candidate.write_text(layout_text, encoding="utf-8")
+    advice = f"review the diff, then replace {golden_path} with {candidate}"
+    raise SystemExit(f"{detail}; {advice}")
+
+# Parse PWShmLayout constants out of CWorker.swift. The regex
+# tolerates Int / UInt32 (and any future numeric type) since the
+# value comparison is what's load-bearing, not the declared type.
+layout_block_match = re.search(
+    r"(?:public\s+)?enum PWShmLayout\s*\{(?P<body>.*?)\n\}",
+    swift_text,
+    re.DOTALL,
+)
+if not layout_block_match:
+    raise SystemExit("could not locate `enum PWShmLayout { ... }` in CWorker.swift")
+layout_body = layout_block_match.group("body")
+
+swift_values: dict[str, int] = {}
+const_re = re.compile(
+    r"(?:public\s+)?static\s+let\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*:\s*[A-Za-z0-9_]+\s*=\s*(?P<value>[^\n]+)"
+)
+for m in const_re.finditer(layout_body):
+    name = m.group("name")
+    raw = m.group("value").strip()
+    # Strip trailing comments and whitespace.
+    raw = re.sub(r"//.*$", "", raw).strip()
+    # Some constants are computed (e.g., regionBytes = headerBytes + ...).
+    # Resolve them by evaluating against the already-collected values.
+    if raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit()):
+        swift_values[name] = int(raw)
+        continue
+    try:
+        # Allow simple arithmetic over previously-declared constants.
+        swift_values[name] = int(eval(raw, {"__builtins__": {}}, swift_values))
+    except Exception as e:
+        raise SystemExit(
+            f"could not parse PWShmLayout constant {name!r} = {raw!r}: {e}"
+        )
+
+mismatches: list[dict] = []
+missing_in_swift: list[str] = []
+covered_swift: set[str] = set()
+
+for c_key, c_val in sorted(printer_values.items()):
+    swift_key = swift_name_for(c_key)
+    covered_swift.add(swift_key)
+    if swift_key not in swift_values:
+        missing_in_swift.append(swift_key)
+        continue
+    if swift_values[swift_key] != c_val:
+        mismatches.append({
+            "c_key": c_key,
+            "swift_key": swift_key,
+            "c_value": c_val,
+            "swift_value": swift_values[swift_key],
+        })
+
+# Catch the reverse direction: a Swift constant nobody on the C side
+# verifies. Identity bytes are checked separately above.
+swift_only = sorted(set(swift_values.keys()) - covered_swift)
+
+report = {
+    "printer_value_count": len(printer_values),
+    "swift_value_count": len(swift_values),
+    "mismatches": mismatches,
+    "missing_in_swift": missing_in_swift,
+    "missing_in_printer": swift_only,
+}
+diff_report.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+problems: list[str] = []
+if mismatches:
+    for m in mismatches:
+        problems.append(
+            f"value disagrees for {m['c_key']!r} → {m['swift_key']!r}: "
+            f"C={m['c_value']} vs Swift={m['swift_value']}"
+        )
+if missing_in_swift:
+    for k in missing_in_swift:
+        problems.append(
+            f"Swift PWShmLayout missing constant {k!r} (C side reports a value for it)"
+        )
+if swift_only:
+    for k in swift_only:
+        problems.append(
+            f"Swift PWShmLayout has constant {k!r} with no corresponding C-side check "
+            f"(extend printer.c to emit a sizeof / offsetof / macro mapping to {k!r})"
+        )
+
+if problems:
+    sys.stderr.write("layout drift detected:\n")
+    for p in problems:
+        sys.stderr.write("  - " + p + "\n")
+    sys.exit(1)
+
+print(f"ok: {len(printer_values)} C↔Swift layout values agree")
+PY
+then
+  LAYOUT_ERR="$(tail -n 1 "${PW_TEST_ARTIFACTS}/layout-check.err" | sed 's/"/\\"/g')"
+  test_fail "layout check failed: ${LAYOUT_ERR}" "{\"diff_report\":\"${DIFF_REPORT}\",\"stderr_log\":\"${PW_TEST_ARTIFACTS}/layout-check.err\"}"
+fi
+
+test_step extension_layout "compare transient issuer channel sizeof and offsets with Swift"
+if ! /usr/bin/xcrun --sdk macosx clang -Wall -Wextra -Werror -O2 -std=c11 \
+    -I "${ABI_HEADER_DIR}" "${SUITE_DIR}/extension_printer.c" -o "${PW_TEST_ARTIFACTS}/extension-printer" \
+    2>"${PW_TEST_ARTIFACTS}/extension-printer.err"; then
+  test_fail "extension channel printer failed to compile"
+fi
+"${PW_TEST_ARTIFACTS}/extension-printer" >"${PW_TEST_ARTIFACTS}/extension-layout.txt"
+if ! "${PW_PYTHON}" -B -S "${SUITE_DIR}/extension_layout.py" "${PW_TEST_ARTIFACTS}/extension-layout.txt" \
+    >"${PW_TEST_ARTIFACTS}/extension-layout.log" 2>&1; then
+  test_fail "transient extension channel layout disagrees"
+fi
+
+test_step "capture" "exercise bounded profile reads against independently constructed objects"
+if ! /usr/bin/xcrun --sdk macosx clang -Wall -Wextra -Wno-deprecated-declarations -O2 -std=c11 \
+    -I "${ABI_HEADER_DIR}" "${SUITE_DIR}/capture.c" -o "${PW_TEST_ARTIFACTS}/capture" \
+    2>"${PW_TEST_ARTIFACTS}/capture.err"; then
+  test_fail "capture.c failed to compile" "{}"
+fi
+if ! "${PW_TEST_ARTIFACTS}/capture"; then
+  test_fail "bounded compiled-object capture controls failed" "{}"
+fi
+test_step limits "compare compiled implementation values and exercise native query boundary"
+for helper in worker_limits validator_limits; do
+  if ! /usr/bin/xcrun --sdk macosx clang -Wall -Wextra -Wno-deprecated-declarations -O2 -std=c11 \
+      -lsandbox "${SUITE_DIR}/${helper}.c" -o "${PW_TEST_ARTIFACTS}/${helper}" \
+      2>"${PW_TEST_ARTIFACTS}/${helper}.err"; then
+    test_fail "${helper}.c failed to compile" "{}"
+  fi
+done
+if ! "${PW_PYTHON}" -B -S "${SUITE_DIR}/limits.py" "${PW_TEST_ARTIFACTS}" \
+    >"${PW_TEST_ARTIFACTS}/limits.log" 2>&1; then
+  test_fail "documented C limits or native query controls disagree" "{\"log\":\"${PW_TEST_ARTIFACTS}/limits.log\"}"
+fi
+test_pass "C and Swift layout agree; bounded compiled-object capture controls pass" \
+  "{\"diff_report\":\"${DIFF_REPORT}\"}"

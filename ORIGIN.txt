@@ -1,0 +1,7 @@
+commit 9e091d9c2134c5a83e58374561177e555ec12fb8
+Author:     Adam Hyland <protonk@gmail.com>
+AuthorDate: Fri Oct 23 16:46:34 2026 -0700
+Commit:     Adam Hyland <protonk@gmail.com>
+CommitDate: Fri Oct 23 16:46:34 2026 -0700
+
+    Characterize log-observer cost and delayed retrieval with two pilots

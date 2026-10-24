@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "runs": [
+    {
+      "path": "runs/validator-selection-receipts-20261018",
+      "run_id": "20261018T220505Z_efebca1e",
+      "reason": "Validator default refactor acceptance; dirty source identified by implementation-source.json and pre-receipt-fix-source.json. Initial runs retain buffered receipt diagnostic; final credits in acceptance-credits.json. Supporting investigation and acceptance records are preserved in commit 69c7dfecfdc688ea56cdc4febd9a9a8a41414b6f.",
+      "source": null,
+      "app_inventory": "artifact-integrity/before.json"
+    },
+    {
+      "path": "runs/worker-doc-launch-20261018",
+      "run_id": "20261018T223601Z_85d8418b",
+      "reason": "Identified worker launch observation L after the accepted refactors; complete original artifacts support docs/worker-launch-observation.json.",
+      "source": "f85c7b094d75bf72931cd4856cb4ad086da20cbe",
+      "app_inventory": "artifact-integrity/before.json"
+    },
+    {
+      "path": "runs/apple-silicon-repair-default-1",
+      "run_id": "20261019T041951Z_8a85f355",
+      "reason": "Apple Silicon review repairs: the fresh signed d98193e candidate passed all 194 default cases. build/ preserves the build transcript, session, provenance, candidate hashes and subsequent test-only source delta.",
+      "source": "d98193e5ea32d93f6acdb70bb65e881d942fcb15",
+      "app_inventory": "artifact-integrity/before.json"
+    },
+    {
+      "path": "runs/apple-silicon-repair-optin-1",
+      "run_id": "20261019T043503Z_54502e91",
+      "reason": "Apple Silicon review repairs: 29 signed-artifact scenarios and 21 build guard builds passed. The refusal case failed because the new missing-file injection ran before chmod; preserve this failure beside the corrected rerun at apple-silicon-repair-optin-2.",
+      "source": "d98193e5ea32d93f6acdb70bb65e881d942fcb15",
+      "app_inventory": "artifact-integrity/before.json"
+    },
+    {
+      "path": "runs/apple-silicon-repair-optin-2",
+      "run_id": "20261019T044306Z_4f12cdb6",
+      "reason": "Apple Silicon review repairs: corrected refusal controls passed all 83 controls and 13 mutation demonstrations; all 45 provenance helper tests and build documentation checks passed. Test source is 9f762a0; the unchanged signed app is from d98193e.",
+      "source": "9f762a09de7fdf9f59f4e7254e7897c5c68a8311",
+      "app_inventory": "artifact-integrity/before.json"
+    },
+    {
+      "path": "runs/gate-p3-checkpoint",
+      "run_id": "20261020T033420Z_8c4e3de3",
+      "reason": "Checkpoint for the validator start gate (ValidatorStartGate, introduced with this pin): the over-budget case at its original 150 ms window. Ungated cold copy lost its record; gated cold copy kept it with 185 ms from spawn return to the start receipt; gated warm and gated 1,000 ms delay kept it; ungated 1,000 ms delay lost it; no system sleep. The tested source was f237590 plus uncommitted checkpoint cases, preserved with unified-log excerpts in checkpoint-source/. Retire this pin when the start gate is replaced or a later retained checkpoint supersedes this one.",
+      "source": null,
+      "app_inventory": "artifact-integrity/before.json"
+    },
+    {
+      "path": "release-acceptance/run-ce60b9fe52c44db6a1d2a64afc6cc2cf",
+      "run_id": "accept-79542c12b30141c381d15d773b4bc2c7",
+      "reason": "PolicyWitness 0.3.2 release ZIP acceptance: signatures, staple, Gatekeeper, allow and deny witnesses, and unchanged archive and extracted app; archived as v0.3.2.",
+      "source": "3c98b39601f2e475bfbcc7d639c6cdcff79b95af",
+      "app_inventory": "before.json",
+      "release": "v0.3.2"
+    },
+    {
+      "path": "runs/release-0.3.2-default",
+      "run_id": "20261020T082532Z_1a339f02",
+      "reason": "PolicyWitness 0.3.2 release validation: the default battery passed against the final stapled app with no skips, unrun cases or harness errors and an unchanged app; archived as v0.3.2.",
+      "source": "3c98b39601f2e475bfbcc7d639c6cdcff79b95af",
+      "app_inventory": "artifact-integrity/before.json",
+      "release": "v0.3.2"
+    }
+  ]
+}

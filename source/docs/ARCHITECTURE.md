@@ -1,0 +1,809 @@
+# PolicyWitness architecture
+
+This tour follows one run through the internals and across their boundaries.
+Read it after the README's [The Experiment](../README.md#the-experiment) section
+and before the directory READMEs. Each section links to the relevant field
+reference, contract, module list, test map or build guide.
+
+The <!-- span architecture.documents.architecture.graphs -->4<!-- /span --> figures are generated from [architecture.json](architecture.json)
+by [generate_architecture.py](generate_architecture.py). Every node and edge in
+a figure has an id, and the table beside the figure names, for that id, the
+source symbol that implements it and the test or rule the manifest names. The
+generator verifies symbol presence and test definition. Follow a node or edge's
+id to inspect its cited implementation and checks. The hand-drawn run timeline
+below cites its sources the same way. Behavior that falls short of a stated promise is
+written where the promise is stated, in a paragraph that opens with "Known
+gap", and indexed in the [last section](#known-gaps).
+
+## Why these processes exist
+
+Two facts about the macOS sandbox shape everything. `sandbox_check` answers
+for a live process, and `sandbox_apply` is one-way: a process that has applied
+a profile keeps it for the rest of its lifetime. A specimen therefore needs a
+fresh process that applies the policy and stays alive long enough to be queried
+and to attempt things. PolicyWitness spawns
+one worker per specimen, applies the policy inside it, and queries it from
+outside.
+
+The reply path must stay outside the policy under test. A `(deny default)`
+profile can deny the worker's own writes and even its exit. The worker therefore
+publishes into a shared region the host mapped and pre-touched before the spawn.
+The unsandboxed host assembles the reply. Published attempt, native-call and progress
+records describe the worker's observations; the host separately observes process
+exit and cleanup. The
+[disposition record](../tests/FAILURE-PROPAGATION-CONTRACT.md#worker-disposition-record)
+keeps those sources distinct.
+
+The host is an XPC service that launchd starts for one specimen and that exits
+shortly after replying, giving each run fresh host state. The controller is a
+separate process so that an envelope is printed whatever the host does,
+including never answering. The controller is Rust and `NSXPCConnection` is an
+Objective-C API, so a small Swift client owns the connection
+([why the launcher shells out](../controller/README.md#why-the-rust-launcher-still-shells-out)).
+
+Known gap: a connection racing the host's retirement can fail at the XPC layer
+before receiving `already_ran`. That failure does not establish refusal before
+admission. The controller can re-acquire an external runner after a qualifying
+`already_ran` refusal and observed host retirement, but does not retry XPC
+connection errors. The [user guide](PolicyWitness.md#external-runners-byoxpc)
+describes the qualification and shared request deadline.
+
+The validator is its own process so that `sandbox_check` runs unsandboxed
+against the worker's PID while the worker is held between applying and
+attempting. The observer runs the unified-log query in its own process group
+under a budget, so a stalled `log show` is cut off and cleaned up without
+touching execution evidence
+([log collection budgets](../controller/README.md#log-collection-budgets-and-cleanup)).
+`sbpl-check` compiles the policy in the controller's own context when the
+client reported the runner unreachable (`xpc_error`), so the envelope still
+carries a compile diagnostic, which matters inside an
+[automation sandbox](../AGENTS.md#sandboxed-automation-harnesses). The diagnostic
+records this separate compilation in the controller's context.
+
+The issuer is separate so native issuance occurs before worker creation under
+ordinary authority, outside the specimen policy. It receives no worker entitlement
+plist. The host prepares the target and observes issuance and cleanup without
+calling sandbox APIs. A bounded transient channel carries the token to the worker;
+only references and publication facts enter retained evidence. The worker consumes
+and releases in its existing phase sequence.
+
+Only the worker (compile/apply and consume/release), the issuer (file issuance),
+the validator (`sandbox_check`) and `sbpl-check` (compile only) call native sandbox APIs; the topology table's
+Native sandbox API column records these roles. Source and artifact checks
+enforce the host's separation through
+[source drift](../tests/suites/source_drift/README.md#invariants) and
+[artifact inspection](../tests/suites/preflight/README.md).
+
+## Process topology
+
+Who starts whom, over what channel, with what lifetime. Locations are given
+at the granularity of "app top level" and "inside the XPC bundle"; the exact
+bundle paths are the contract in the README's
+[Build and bundle](../README.md#build-and-bundle). The C worker, validator and issuer sit
+inside the XPC bundle so that the built-in runner and a BYOXPC copy each
+resolve their own helpers relative to their own bundle.
+
+<!-- BEGIN GENERATED ARCHITECTURE GRAPH topology -->
+![Process topology](architecture-topology.svg)
+
+*Figure: process topology. Generated from [architecture.json](architecture.json) by [generate_architecture.py](generate_architecture.py); dot source in [architecture-topology.dot](architecture-topology.dot). The ids in the figure are the ids in the tables below, and each row cites the source symbol that implements it and the test or rule the manifest names for it. Symbol presence and test definition are verified; whether a test asserts the row is not verified.*
+
+<details>
+<summary>Process topology: 12 nodes and 14 edges, with symbol presence and test definition verified; whether a test asserts the row is not verified</summary>
+
+#### Process topology nodes
+
+| Id | Node | Kind | Where | Lifetime | Language | Started by | Sandboxed | Native sandbox API | Sources | Checks | Limits |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| user | the caller | person | a shell or a harness | owns the request file and reads the envelope |  |  |  |  | [`pub fn run`](../controller/src/cli.rs) | [`check_cli_surface_agreement`](../tests/suites/source_drift/check.py) |  |
+| controller | policy-witness | executable | app top level | one run | Rust | the caller | no | none | [`fn main`](../controller/src/main.rs); [`cmd_run`](../controller/src/run_flow.rs) | [`consumer_controls`](../tests/suites/blackbox_e2e/checker_controls.py); [`inventory`](../tests/lib/artifact.py) |  |
+| client | pw-runner-client | executable | app top level | one acquisition attempt; external pre-admission refusals can require another client within the same deadline | Swift | the controller | no | none | [`acquire`](../controller/src/runner_acquisition.rs); [`readDataToEndOfFile`](../runner/Clients/PWRunnerClient/main.swift); [`NSXPCConnection`](../runner/Clients/PWRunnerClient/main.swift) | [`path_wire_fixtures_survive_capture_serialization_and_independent_consumer`](../controller/src/runner_client.rs); [`client_output_control`](../tests/suites/blackbox_e2e/checker_controls.py); [`retirement_and_pid_reuse_allow_only_a_fresh_attempt_with_remaining_budget`](../controller/src/runner_acquisition.rs) |  |
+| host | PWRunner | executable | inside the XPC bundle | one specimen; exits 50 milliseconds after replying | Swift | launchd: XPC service lookup, or a Mach service for BYOXPC | no | none, by the invariance rule | [`NSXPCListener.service()`](../runner/Services/PWRunner/main.swift); [`runSpecimen`](../runner/Sources/PWRunnerCore/PWRunnerService.swift); [`hostExitDelayMs`](../runner/Sources/PWRunnerCore/PWRunnerService.swift) | [`inspect`](../tests/lib/artifact.py); [`check_host_invariance`](../tests/suites/source_drift/check.py); [`runServiceAdmissionTests`](../runner/Tests/PWRunnerCoreTests/ServiceAdmissionTests.swift); [`single_use`](../tests/suites/runner_byoxpc/opt_in/single_use.sh) | [`host_exit_delay`](LIMITS.md#execution-budgets) |
+| worker | pw-probe-runner | sandboxed | inside the XPC bundle | one specimen; one application and all ordered phases; terminal publication exits without host permission | C | the host | yes; applies the specimen policy to itself | sandbox_compile_string, params, sandbox_apply; sandbox_extension_consume and sandbox_extension_release | [`sandbox_compile_string`](../controller/tools/pw_probe_runner/pw_probe_runner.c); [`sandbox_apply`](../controller/tools/pw_probe_runner/pw_probe_runner.c); [`publish_done_and_exit`](../controller/tools/pw_probe_runner/pw_probe_runner.c) | [`exec_control_states`](../tests/suites/runner_c_worker_harness/run.sh); [`happy_default_allow`](../tests/suites/runner_use_c_worker/run.sh); [`runPhaseProtocolTests`](../runner/Tests/PWRunnerCoreTests/PhaseProtocolTests.swift); [`run_targets`](../tests/suites/witness_contract/check_extensions.py); [`run_case`](../tests/suites/witness_contract/check_extension_boundaries.py); [`check_row`](../tests/suites/witness_contract/check_extension_combinations.py); [`terminal_exit_without_request`](../tests/suites/runner_c_worker_harness/run.sh) |  |
+| exec_child | exec helper children | sandboxed | the caller's path | the worker bounds collection and leader reap; ordinary completion and worker death can leave same-group descendants alive; escaped descendants are not contained | caller-supplied | the worker | inherit the worker's sandbox | none of PolicyWitness's | [`attempt_exec_spawn`](../controller/tools/pw_probe_runner/pw_probe_runner.c); [`exec_resources_acquire`](../controller/tools/pw_probe_runner/pw_probe_runner.c) | [`timeout_preserves_output_and_continues`](../tests/suites/runner_exec_lifecycle/run.sh); [`contaminated_worker`](../tests/suites/runner_exec_inheritance/run.sh); [`closed_streams_leader_exit`](../tests/suites/runner_exec_lifecycle/closed_streams_leader_exit.sh); [`worker_dies_during_exec`](../tests/suites/runner_exec_lifecycle/run.sh); [`main`](../tests/fixtures/worker_lifecycle/exec_control.c) |  |
+| validator | sb_api_validator | executable | inside the XPC bundle | one phase collection | C | the host at each eligible phase arrival | no | sandbox_check | [`sandbox_check`](../controller/tools/sb_api_validator/sb_api_validator.c); [`SANDBOX_CHECK_NO_REPORT`](../controller/tools/sb_api_validator/sb_api_validator.c); [`runValidator`](../runner/Sources/PWRunnerCore/ValidatorClient.swift) | [`predictions_do_not_report`](../tests/suites/validator_batch_mode/run.sh); [`bothBinariesExist`](../runner/Tests/PWRunnerCoreTests/CWorkerValidatorTests.swift); [`runPhaseProtocolTests`](../runner/Tests/PWRunnerCoreTests/PhaseProtocolTests.swift) |  |
+| observer | sandbox-log-observer | executable | app top level | one scan | Rust | the controller, after execution completes, in its own process group | no | none | [`capture_sandbox_logs_with_timeout`](../controller/src/sandbox_log.rs); [`process_group`](../controller/src/log_capture.rs) | [`parsed_event_retains_pid_operation_and_raw_line_without_temporal_claims`](../controller/src/bin/sandbox-log-observer.rs); [`checked_reads`](../tests/suites/witness_contract/check_deny_capture_window.py) |  |
+| log_show | log show | os | /usr/bin/log | one query | OS | the observer | no | none | [`Command::new("/usr/bin/log")`](../controller/src/bin/sandbox-log-observer.rs) | [`both_raw_streams_are_bounded_at_exact_edges`](../controller/src/log_capture.rs) |  |
+| sbpl_check | sbpl-check | executable | app top level | one compile | Rust | the controller, only for an admitted xpc_error reply | no | sandbox_compile_string and params; never applies | [`sandbox_compile_string`](../controller/src/bin/sbpl-check.rs); [`run_policy_check`](../controller/src/policy_check.rs) | [`fallback_compilation_is_requested_only_for_an_admitted_xpc_error`](../controller/src/run_flow.rs) |  |
+| launchd | launchd | os | system |  | OS |  | no | none | [`NSXPCListener(machServiceName:`](../runner/Services/PWRunner/main.swift); [`MachServices`](../controller/src/runner_manager.rs) | [`pwrunner_survives_mach_service_launch`](../tests/suites/runner_mach_service_liveness/run.sh); [`runner_install`](../tests/suites/runner_byoxpc/run.sh) |  |
+| issuer | pw-extension-issuer | executable | inside the XPC bundle | one declaration before worker creation; confirmed clean reap required for delivery | C | the host | outside the specimen policy; ordinary process authority | sandbox_extension_issue_file | [`sandbox_extension_issue_file`](../controller/tools/pw_probe_runner/pw_extension_issuer.c); [`ExtensionSession`](../runner/Sources/PWRunnerCore/ExtensionIssuer.swift) | [`run_targets`](../tests/suites/witness_contract/check_extensions.py); [`run_case`](../tests/suites/witness_contract/check_extension_boundaries.py); [`runExtensionEvidenceTests`](../runner/Tests/PWRunnerCoreTests/ExtensionEvidenceTests.swift); [`check_row`](../tests/suites/witness_contract/check_extension_combinations.py) |  |
+
+#### Process topology edges
+
+| Id | From | To | Kind | Edge | Sources | Checks | Limits |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| T1 | user | controller | channel | argv in; one JSON envelope on stdout | [`pub fn run`](../controller/src/cli.rs); [`print_envelope`](../controller/src/json_contract.rs) | [`check_cli_surface_agreement`](../tests/suites/source_drift/check.py); [`envelope_shape_golden_agrees_with_the_manifest`](../controller/src/run_flow.rs) |  |
+| T2 | controller | client | spawn | spawn; held request on stdin, read to EOF; reply on stdout | [`run_pw_runner_client`](../controller/src/runner_client.rs); [`readDataToEndOfFile`](../runner/Clients/PWRunnerClient/main.swift) | [`path_wire_fixtures_survive_capture_serialization_and_independent_consumer`](../controller/src/runner_client.rs); [`client_output_control`](../tests/suites/blackbox_e2e/checker_controls.py) |  |
+| T3 | client | host | channel | NSXPC runSpecimen(Data) and its reply | [`NSXPCConnection`](../runner/Clients/PWRunnerClient/main.swift); [`runSpecimen`](../runner/Sources/PWRunnerCore/PWRunnerService.swift); [`authorizedCaller`](../runner/Sources/PWRunnerCore/PWRunnerService.swift) | [`happy_default_allow`](../tests/suites/runner_use_c_worker/run.sh); [`accepted_input_contract`](../tests/suites/runner_outcome_bad_request/run.sh) |  |
+| T4 | launchd | host | launch | start on XPC lookup, or as a Mach service (BYOXPC) | [`NSXPCListener.service()`](../runner/Services/PWRunner/main.swift); [`NSXPCListener(machServiceName:`](../runner/Services/PWRunner/main.swift); [`launchctl_bootstrap`](../controller/src/runner_manager.rs) | [`pwrunner_survives_mach_service_launch`](../tests/suites/runner_mach_service_liveness/run.sh); [`runner_install`](../tests/suites/runner_byoxpc/run.sh) |  |
+| T5 | host | worker | spawn | posix_spawn; fd 0 policy pipe, fd 3 shared region, fd 4 ready pipe; optional fd 5 transient token channel | [`posix_spawn_file_actions_adddup2`](../runner/Sources/PWRunnerCore/CWorker.swift); [`F_SETNOSIGPIPE`](../runner/Sources/PWRunnerCore/CWorker.swift); [`writePolicy`](../runner/Sources/PWRunnerCore/MonotonicDeadline.swift); [`PW_SHM_ABI_MAGIC`](../controller/tools/pw_probe_runner/pw_probe_runner_abi.h); [`PW_FAILURE_SOURCE_LENGTH`](../controller/tools/pw_probe_runner/pw_probe_runner.c) | [`c_swift_layout_agreement`](../tests/suites/runner_abi_layout/run.sh); [`exec_control_states`](../tests/suites/runner_c_worker_harness/run.sh); [`runPolicyTransferTests`](../runner/Tests/PWRunnerCoreTests/PolicyTransferTests.swift); [`run_case`](../tests/suites/witness_contract/check_extension_boundaries.py); [`check_row`](../tests/suites/witness_contract/check_extension_combinations.py); [`policy_truncated_prefix`](../tests/suites/runner_c_worker_harness/run.sh) |  |
+| T6 | host | validator | spawn | fresh posix_spawn --batch <pid> per eligible phase; bundle-local default or explicit override; bounded NDJSON | [`runValidator`](../runner/Sources/PWRunnerCore/ValidatorClient.swift); [`decodeValidatorFrames`](../runner/Sources/PWRunnerCore/ValidatorClient.swift); [`defaultValidatorExecutablePath`](../runner/Sources/PWRunnerCore/CWorkerOrchestrator.swift); [`runSpecimen`](../runner/Sources/PWRunnerCore/PWRunnerService.swift) | [`predictions_do_not_report`](../tests/suites/validator_batch_mode/run.sh); [`transcript_controls`](../tests/suites/runner_validator_failure/run.sh); [`runPhaseProtocolTests`](../runner/Tests/PWRunnerCoreTests/PhaseProtocolTests.swift); [`runValidatorSelectionTests`](../runner/Tests/PWRunnerCoreTests/ServiceAdmissionTests.swift); [`runOrderingTests`](../runner/Tests/PWRunnerCoreTests/OrderingTests.swift) |  |
+| T7 | validator | worker | native | sandbox_check against the worker PID, with SANDBOX_CHECK_NO_REPORT | [`sandbox_check`](../controller/tools/sb_api_validator/sb_api_validator.c); [`SANDBOX_CHECK_NO_REPORT`](../controller/tools/sb_api_validator/sb_api_validator.c) | [`predictions_do_not_report`](../tests/suites/validator_batch_mode/run.sh); [`independent_worker_and_host_queries`](../tests/suites/runner_live_worker_identity/run.sh) |  |
+| T8 | worker | host | channel | immutable phase arrivals, acknowledgements and completions; numbered releases before actions; separate native call markers/results and fresh-read syscall observations | [`wait_for_proceed`](../controller/tools/pw_probe_runner/pw_probe_runner.c); [`run_attempt`](../controller/tools/pw_probe_runner/pw_probe_runner.c); [`CWorkerStepResult`](../runner/Sources/PWRunnerCore/CWorker.swift); [`proceedOffset`](../runner/Sources/PWRunnerCore/CWorker.swift) | [`signal_while_waiting`](../runner/Tests/PWRunnerCoreTests/OrderingTests.swift); [`order_barrier_mutations`](../tests/suites/witness_contract/opt_in/mutations.sh); [`runPhaseProtocolTests`](../runner/Tests/PWRunnerCoreTests/PhaseProtocolTests.swift); [`run_case`](../tests/suites/witness_contract/check_extension_boundaries.py); [`check_row`](../tests/suites/witness_contract/check_extension_combinations.py); [`proceed_precedence`](../tests/suites/runner_c_worker_harness/run.sh) |  |
+| T9 | worker | exec_child | spawn | posix_spawn after apply; stdout and stderr pipes into bounded slot buffers | [`attempt_exec_spawn`](../controller/tools/pw_probe_runner/pw_probe_runner.c); [`exec_resources_acquire`](../controller/tools/pw_probe_runner/pw_probe_runner.c) | [`timeout_preserves_output_and_continues`](../tests/suites/runner_exec_lifecycle/run.sh); [`exec_control_states`](../tests/suites/runner_c_worker_harness/run.sh) |  |
+| T10 | controller | observer | spawn | spawn in its own process group after execution; budget on argv; JSON report on stdout | [`capture_sandbox_logs_with_timeout`](../controller/src/sandbox_log.rs); [`capture_with_ops`](../controller/src/log_capture.rs); [`process_group`](../controller/src/log_capture.rs) | [`both_raw_streams_are_bounded_at_exact_edges`](../controller/src/log_capture.rs); [`checked_reads`](../tests/suites/witness_contract/check_deny_capture_window.py) |  |
+| T11 | observer | log_show | spawn | log show over the padded client span; text on stdout, bounded | [`Command::new("/usr/bin/log")`](../controller/src/bin/sandbox-log-observer.rs); [`capture_sandbox_logs_with_timeout`](../controller/src/sandbox_log.rs) | [`run_span_window_floors_start_ceils_end_and_never_collapses`](../controller/src/sandbox_log.rs); [`both_raw_streams_are_bounded_at_exact_edges`](../controller/src/log_capture.rs) |  |
+| T12 | controller | sbpl_check | spawn | spawn only for an admitted xpc_error reply; held request in; helper envelope out | [`fallback_policy_check`](../controller/src/run_flow.rs); [`run_policy_check`](../controller/src/policy_check.rs) | [`fallback_compilation_is_requested_only_for_an_admitted_xpc_error`](../controller/src/run_flow.rs); [`refused_reply_versions_request_no_fallback_compilation`](../controller/src/run_flow.rs) |  |
+| T13 | host | issuer | spawn | fresh ordinary-authority issuer; fd 3 token mapping, stdio /dev/null, empty environment | [`posix_spawn`](../runner/Sources/PWRunnerCore/ExtensionIssuer.swift); [`main`](../controller/tools/pw_probe_runner/pw_extension_issuer.c) | [`run_targets`](../tests/suites/witness_contract/check_extensions.py); [`run_case`](../tests/suites/witness_contract/check_extension_boundaries.py); [`runExtensionEvidenceTests`](../runner/Tests/PWRunnerCoreTests/ExtensionEvidenceTests.swift); [`check_row`](../tests/suites/witness_contract/check_extension_combinations.py) | [`extension_issuer_wait`](LIMITS.md#execution-budgets) |
+| T14 | issuer | host | channel | native issuance publication and bounded transient token bytes; host owns cleanup and delivery eligibility | [`token_length`](../controller/tools/pw_probe_runner/pw_extension_issuer.c); [`deliveryDescriptor`](../runner/Sources/PWRunnerCore/ExtensionIssuer.swift) | [`run_case`](../tests/suites/witness_contract/check_extension_boundaries.py); [`runExtensionEvidenceTests`](../runner/Tests/PWRunnerCoreTests/ExtensionEvidenceTests.swift); [`check_row`](../tests/suites/witness_contract/check_extension_combinations.py) | [`extension_token_storage`](LIMITS.md#queries-and-transport) |
+
+Notes:
+
+- `host`: All authorized connections share one terminal, locked request claim. Only its owner schedules host exit; connections racing retirement can still fail before refusal.
+- `T5`: Policy delivery uses nonblocking writes under one absolute monotonic deadline (the worker_policy_transfer limit) beginning after spawn. Expiry closes input and enters cleanup before readiness or sentinel polling. The pipe carries no framing: the host writes the submission's byte count into the shared header before spawn, and the worker at EOF publishes the count it read and refuses a different length before compiling.
+- `T13`: Issuer wait 5,000 milliseconds; cleanup may overrun. Missing capability refuses extension specimens.
+- `T14`: Token storage 16,384 bytes; raw bytes never enter reply fields.
+
+Every node and edge above cites at least one test or rule.
+
+</details>
+<!-- END GENERATED ARCHITECTURE GRAPH topology -->
+
+## One run in time
+
+The host closes query collection before releasing the actions of each phase.
+`comparison.order: "query_first"` requires that phase's eligible native record
+and observed collection, release, acknowledgement and ownership chain
+([the record](../tests/FAILURE-PROPAGATION-CONTRACT.md#the-record)). A simple
+`probe_plan` becomes one phase named `main`; all phases use one worker and one
+policy application. The sequence below follows [CWorker.swift](../runner/Sources/PWRunnerCore/CWorker.swift),
+[CWorkerOrchestrator.swift](../runner/Sources/PWRunnerCore/CWorkerOrchestrator.swift)
+and the [C worker](../controller/tools/pw_probe_runner/pw_probe_runner.c).
+
+With a declaration, admission also checks references, lifecycle caps and exec
+exclusion. The host then resolves the submitted target and records metadata,
+launches its bundle-local issuer, and waits for its native result and cleanup.
+Only complete bounded issuance and confirmed clean reaping permit delivery.
+Preparation failure and other issuance failures remain observations; missing
+helper/native issuance capability produces a named refusal before the worker.
+The submitted query and attempt targets retain their original values.
+
+```text
+host                                      issuer (before worker creation)
+----                                      ------------------------------
+resolve target; record metadata
+create transient mapping; spawn --------> map fd 3; close fd; issue file token
+                                          publish native result and length
+                                          erase private token; exit
+wait; terminate if needed; reap
+validate publication and token bound
+pass eligible channel as worker fd 5
+```
+
+```text
+controller / client          host                        worker                validator
+-------------------          ----                        ------                ---------
+read; gate; select;
+resolve augments;
+serialize held request
+stdin to EOF; XPC ----------> authorize; decode; admit
+                             prepare shared region
+                             spawn; policy pipe --------> compile; ready byte
+                                                         apply once
+                             <--------------------------- phase arrival
+                             check identity + ownership
+                             plan this phase afresh
+                             spawn eligible collection -----------------------> sandbox_check
+                             <----------------------------------------------- bounded NDJSON
+                             collection closes
+                             recheck phase + ownership
+                             numbered release ----------> acknowledge ordinal
+                                                         ordinary/native actions in order
+                                                         publish completion
+                             <--------------------------- next phase arrival
+                             repeat collection/release   repeat phases
+                                                         erase token; done; exit
+                             exit request (cancellation/cleanup)
+                             grace; kill if needed; reap
+                             final snapshot; disposition;
+                             phase/native evidence; comparisons; erase token mapping
+reply <--------------------- encode; schedule host exit
+admit reply version;
+complete execution;
+optional logs;
+print envelope
+```
+
+Collection can close with unavailable predictions or incomplete validator
+cleanup. Release still requires a live, correctly waiting worker. A failed
+phase wait, invalid release ordinal or loss of worker ownership prevents later
+actions while preserving earlier publications. A boundary publication records
+progress; each action publishes its result separately.
+Native pre-call markers and completed result publication are distinct. A call
+without a published result remains unresolved even if an independent test knows
+it returned. A consume/release action before an ordinary action in the same
+phase can change what that action encounters after its query was collected.
+Read phase progress as the observed sequence of collections and actions.
+The worker exits after terminal publication without waiting for host permission.
+The host's mapping retains its publications. An acknowledgement acquired after
+confirmed reap can establish the earlier phase interval while ownership remained
+unbroken, including when fatal termination followed acknowledgement without
+`done`. The run retains its independently observed abnormal disposition.
+
+Where each stage is pinned:
+
+- **Controller admission and selection.** [`run`](../controller/src/run_flow.rs) in
+  run_flow.rs: the manifest is loaded once,
+  then `parse_request`, `validate_request_version`, selector parsing,
+  `resolve_runner_target_with_registry`, `resolve_augments`, the dossier, and
+  `strip_runner_selector` before the held bytes are serialized. Checked by the
+  `orchestration` tests in the same file.
+- **Extension preparation and issuer lifetime.**
+  [`ExtensionSession`](../runner/Sources/PWRunnerCore/ExtensionIssuer.swift)
+  records target resolution and metadata before a fresh native issuer, admits
+  bounded publication only after confirmed clean reap, and clears the mapping.
+  [`run_targets`](../tests/suites/witness_contract/check_extensions.py) checks
+  placement, symlinks, preparation failure and replacement independently;
+  [`run_case`](../tests/suites/witness_contract/check_extension_boundaries.py)
+  drives native interruption, malformed transport and token confinement.
+  [`runExtensionEvidenceTests`](../runner/Tests/PWRunnerCoreTests/ExtensionEvidenceTests.swift)
+  inspects actual mapping erasure and withholds delivery after an unconfirmed reap.
+- **Caller authorization.** [`authorizedCaller`](../runner/Sources/PWRunnerCore/PWRunnerService.swift) runs when the connection is
+  accepted, before any request is read.
+- **Host admission.** `runSpecimen` decodes with closed keys, then
+  `admissionFailure(for:)` (capacity), `requestMeaningFailure` (meaning) and
+  `computePolicyHash`, in that order; a refusal replies without spawning
+  anything. Checked by `runner_outcome_bad_request` and `failure_boundaries`.
+- **Query planning.** `planValidatorQueries` runs anew at each observed phase
+  arrival, after all prior phase actions have completed. It drops excluded
+  operation/filter pairs and paths that do not resolve on the host then.
+  `path_unresolved_at_planning` supplies an explicit unavailable prediction
+  without suppressing the paired attempt. Checked by `PhaseProtocolTests`,
+  query admission tests and the planner rule in `source_drift`.
+- **Spawn and apply.** The driver's header comment in
+  [CWorker.swift](../runner/Sources/PWRunnerCore/CWorker.swift) from the
+  region setup through the ready byte, and the worker's from mapping the
+  region through apply. The ready byte has its own window
+  (`readyByteTimeoutMs`); `runner_ready_byte_resilience` checks it.
+- **Compiled-object receipt.** When the request opts in, the worker copies
+  the compiled object into the capture region before applying it
+  (`pw_capture_profile`). The host admits that copy only after successful
+  application, worker completion, PID, nonce, input identity and payload
+  integrity checks (`decodeProfileCapture`); the
+  [guide](PolicyWitness.md#compiled-object-receipt-opt-in) defines the receipt's
+  provenance and reading rules. Checked by `CompiledProfileCaptureTests`.
+- **The barrier.** The `phaseBoundary` callback collects against the worker's
+  PID. The driver observes arrival and checks child ownership before collection
+  and again before release. Its ordinal store cannot reuse an earlier release;
+  immutable phase acknowledgement records preserve earlier observations.
+  `PWRunnerOrdering` is assembled independently per phase. `PhaseProtocolTests`,
+  `OrderingTests` and the opt-in
+  [order-barrier mutation control](../tests/OPT_IN_TESTS.md) check the protocol.
+- **Attempts and publication.** `run_attempt` writes each slot and releases
+  `completed`; an exec attempt acquires its pipes and spawn handles after
+  apply and releases them before its slot completes. Checked by
+  `runner_c_worker_harness` and `runner_exec_lifecycle`.
+- **Exit, grace and kill.** `publish_done_and_exit` erases accepted token storage
+  before releasing `done` and exiting. The driver's exit request, grace and
+  termination still cover cancellation and cleanup; confirmed reap permits a
+  final acknowledgement observation without restoring a broken ownership chain.
+  The worker harness's `terminal_exit_without_request` and `terminal_erasure`
+  controls cover autonomous exit and erasure before publication;
+  `runner_outcome_runner_timeout/host_kills_hung_worker` checks the kill path
+  and `runner_use_c_worker` the ordinary one.
+- **Reply and envelope.** `reply_version` admits the reply or retains it
+  unread; `fallback_policy_check` runs only for an admitted `xpc_error`;
+  `complete_execution` projects the disposition; `attach_sandbox_logs` adds
+  log evidence without touching execution fields. Checked by the Rust unit
+  tests named in the boundary tables below.
+
+The client's timeout ends the controller's wait and yields a synthetic
+`xpc_timeout` reply. Host work continues independently. The host's cleanup can
+fail: `terminate` makes one blocking wait
+after a successful kill request, and when no reap is confirmed the
+collection basis reads `execution_may_continue` rather than
+`after_confirmed_reap`. The
+[failure evidence contract](../tests/FAILURE-PROPAGATION-CONTRACT.md#host-observations)
+records reply delivery, the end of observation and the end of execution
+separately. There is no global lifecycle deadline.
+
+The worker tour owns the [exec-descendant limitation](WORKER.md#acquisitions-inside-attempts)
+and explains the resources and observations retained during exec cleanup.
+
+Each budget covers a specific stage. The issuer's monotonic wait,
+[`extension_issuer_wait`](LIMITS.md#execution-budgets), begins after issuer spawn
+and precedes worker creation. Target preparation and spawn are outside that wait;
+issuer cleanup can overrun it. The client reply window includes this work, while
+worker and phase collection budgets have not started. Policy delivery has its own
+absolute monotonic deadline, [`worker_policy_transfer`](LIMITS.md#execution-budgets),
+started immediately after the spawn; the ready window,
+[`worker_ready_wait`](LIMITS.md#execution-budgets), covers only the wait for the
+ready byte after the policy has been written; the sentinel deadline,
+[`worker_sentinel_wait`](LIMITS.md#execution-budgets), covers application through
+`done`, less every phase collection interval, because callbacks run
+synchronously between polls; the
+validator I/O deadline, [`validator_io_wait`](LIMITS.md#execution-budgets), covers
+one collection, capped by the remaining cumulative
+[`phase_collection_wait`](LIMITS.md#execution-budgets) allowance for planning and
+collection across all phases. Cleanup time is charged to that allowance but can
+overrun it; exhausted later phases retain unavailable predictions. The proceed budget, [`worker_proceed_wait`](LIMITS.md#execution-budgets),
+covers each worker phase's wait for its exact release ordinal; the grace timer,
+[`worker_exit_grace`](LIMITS.md#execution-budgets), covers exit request to kill; the
+exec deadline and attempt budget, [`exec_child_wait`](LIMITS.md#execution-budgets) and
+[`exec_attempt_budget`](LIMITS.md#execution-budgets), cover the worker's waits on exec
+children, per step and per plan, excluding every measured phase release wait; the log budget,
+[`log_collection_timeout`](LIMITS.md#evidence-capture), covers the observer.
+The worker's release wait and exec allowances count continuous Mach time,
+which includes system sleep, in one validated tick domain; host waits keep
+their own clock, and no worker time is compared with them.
+The ready and sentinel budgets are elapsed monotonic allowances: each sleep is
+bounded by what remains, polling costs consume it, the sentinel allowance
+excludes measured phase collection intervals, and expiry starts cleanup rather
+than promising a total response time. Their values and their checks are in
+[LIMITS.md](LIMITS.md).
+
+The host sends policy bytes through a nonblocking pipe under the delivery
+deadline ([`writePolicy`](../runner/Sources/PWRunnerCore/MonotonicDeadline.swift) and [`MonotonicDeadline`](../runner/Sources/PWRunnerCore/MonotonicDeadline.swift) in
+MonotonicDeadline.swift).
+Partial writes, interruptions and backpressure consume the same allowance.
+Expiry records `policy_transfer_timeout` separately from any write errno,
+closes input and enters cleanup without starting readiness or sentinel polling.
+Counts describe writes accepted by the pipe. The worker's account of what it
+read is separate: the host writes the submission's byte count into the shared
+header before spawn, and the worker, at EOF, publishes the count it read
+(`policy_read` in the reply) and refuses a different length before compiling,
+so a delivery cut after a complete form is never applied as a shorter policy.
+`PolicyTransferTests` checks a stalled reader, exact draining delivery, deadline
+edge cases, cleanup failures and the truncated delivery the shipped worker
+refuses after the host's timeout; the actual driver replies pass through
+controller assembly and the independent consumer. The worker harness pins the
+refusal, the receipt and both directions of the comparison without the host.
+The deadline does not bound final reap or cancel an earlier client timeout.
+
+## Evidence channels and ownership
+
+The channels that reach the envelope are tabulated below. Each native result has one writer. The
+host preserves native results and adds its own observations beside them; the
+controller does the same with the host's.
+
+| Channel | Native result written by | Host adds | Where it lands | What it is |
+| --- | --- | --- | --- | --- |
+| Prediction | the validator | an explicit `prediction_unavailable` observation for a step the planner excluded; path diagnostics after orchestration | `steps[].sandbox_check` | one `sandbox_check` verdict per predicted step |
+| Attempt | the worker, through the shared region | the lifecycle copies; path diagnostics after orchestration | `steps[].attempt` | the attempted operation's own result, with `rc` and `errno` |
+| Extension preparation/issuance | issuer publishes native facts | resolved target/metadata, process authority and independent cleanup; delivery and host erasure observations | `extensions[]` | target identity at preparation, native issuance and delivery observations |
+| Native lifecycle | worker call marker and result slot | phase/reference association and lifecycle claims | `extension_events[]` | consume handle or release result when published |
+| Fresh read | worker syscalls after apply | phase and step association | `steps[].attempt.fresh_read` | fresh descriptor identity and bounded bytes, separate open/stat/read/close results |
+| Comparison | the host | nothing further | `steps[].comparison` | the attempt's classified observation, the submitted-scope relations, the order established, and the limitations |
+| Disposition | the host, from raw facts it cites | the controller's projection | `runner_subprocess.disposition`; `data.runner_sandbox_diagnostics` (execution fields) | what happened to the worker process, answered only from the cited facts |
+| Compiled-object receipt | the worker, before apply, when asked | admission after application, completion, PID, nonce and integrity checks | `compiled_profile` | a worker copy of the compiled object before apply |
+| Dossier | the controller | nothing further | `data.specimen` | the request as submitted, augmentation and imports, host facts, runner and app provenance, binary hashes observed before invocation |
+| Log capture | the observer | the controller's correlation fields | `data.sandbox_log_capture`; `data.runner_sandbox_diagnostics` (log fields) | deny records the unified log showed in the padded window, with candidate associations |
+
+Log evidence is attached after execution evidence is complete. The assembly
+seam is [`attach_sandbox_logs`](../controller/src/run_flow.rs) in run_flow.rs,
+where the collector receives
+read-only execution evidence and returns only log-owned fields; the unit test
+`collector_states_preserve_the_serialized_execution_half` checks it, and the
+controller README's
+[ownership table](../controller/README.md#execution-and-log-evidence-ownership)
+names the owner of every field. The host's additions are
+[`enrichPathDiagnostics`](../runner/Sources/PWRunnerCore/PWRunnerService.swift) in
+PWRunnerService.swift
+and the planner's synthesized observations in
+[CWorkerOrchestrator.swift](../runner/Sources/PWRunnerCore/CWorkerOrchestrator.swift).
+The [failure evidence contract](../tests/FAILURE-PROPAGATION-CONTRACT.md#comparison-record)
+defines the reply's normative semantics and the comparison record's reading rules.
+
+## Boundaries
+
+Each node below is a record that crosses from one owner to another, and each
+edge is the guard that lets it cross. [contract.json](contract.json) owns the
+wire version numbers. The identity generator produces one host/worker source
+identity; the build checks its copies and refuses stale ones without rewriting
+them ([CONTRACT.md](CONTRACT.md#internal-hostworker-identity)). The records that carry a local version field
+of their own, each read by exactly one receiver, are the observer report,
+the evidence manifest, the runner registry, the validator NDJSON and the compiled-object receipt,
+and the node table's Form column names each one's field. Every other
+boundary is held by a golden, a suite, or by being built and shipped
+together, and the edge table says which.
+
+<!-- BEGIN GENERATED ARCHITECTURE GRAPH boundaries -->
+![Boundaries and their guards](architecture-boundaries.svg)
+
+*Figure: boundaries and their guards. Generated from [architecture.json](architecture.json) by [generate_architecture.py](generate_architecture.py); dot source in [architecture-boundaries.dot](architecture-boundaries.dot). The ids in the figure are the ids in the tables below, and each row cites the source symbol that implements it and the test or rule the manifest names for it. Symbol presence and test definition are verified; whether a test asserts the row is not verified.*
+
+<details>
+<summary>Boundaries and their guards: 14 nodes and 16 edges, with symbol presence and test definition verified; whether a test asserts the row is not verified</summary>
+
+#### Boundaries and their guards nodes
+
+| Id | Node | Kind | Owner | Form | Sources | Checks | Limits |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| request_file | request JSON | record | the caller | a JSON file naming the request schema | [`parse_request`](../controller/src/request_patch.rs) | [`accepted_input_contract`](../tests/suites/runner_outcome_bad_request/run.sh) |  |
+| held_request | held request bytes | record | the controller | one serialization; selectors stripped, augments spliced | [`strip_runner_selector`](../controller/src/runner_select.rs); [`pub fn resolve_augments`](../controller/src/augments.rs) | [`invalid_request_version_stops_before_selection_augments_or_client_invocation`](../controller/src/run_flow.rs) |  |
+| run_spec | decoded request (PWRunnerRunSpec) | record | the host | Codable with closed keys | [`PWRunnerRunSpec`](../runner/Sources/PWRunnerCore/PWRunnerAPI.swift); [`CodingKeys`](../runner/Sources/PWRunnerCore/PWRunnerAPI.swift) | [`accepted_input_contract`](../tests/suites/runner_outcome_bad_request/run.sh); [`admission`](../tests/suites/failure_boundaries/check.py) |  |
+| shm_region | shared region and policy pipe (worker ABI) | record | host writes inputs, worker writes outputs | fixed layout; magic at byte 0, source identity at byte 64 | [`PW_SHM_ABI_MAGIC`](../controller/tools/pw_probe_runner/pw_probe_runner_abi.h); [`PW_WORKER_ABI_IDENTITY_HEX`](../controller/tools/pw_probe_runner/pw_probe_runner_abi.h); [`PWShmLayout`](../runner/Sources/PWRunnerCore/CWorker.swift) | [`c_swift_layout_agreement`](../tests/suites/runner_abi_layout/run.sh); [`PW_SHM_`](../tests/fixtures/contract/abi_layout.txt) |  |
+| validator_wire | validator NDJSON (probes and verdicts) | record | host and validator, co-shipped in one bundle | bounded NDJSON; exact kind sb_api_validator_verdict and schema_version 1 | [`sb_api_validator_verdict`](../runner/Sources/PWRunnerCore/ValidatorClient.swift); [`decodeValidatorFrames`](../runner/Sources/PWRunnerCore/ValidatorClient.swift); [`sandbox_check`](../controller/tools/sb_api_validator/sb_api_validator.c) | [`predictions_do_not_report`](../tests/suites/validator_batch_mode/run.sh); [`validator_overlong_request`](../tests/suites/failure_boundaries/check.py); [`runValidatorEvidenceTests`](../runner/Tests/PWRunnerCoreTests/ValidatorEvidenceTests.swift) |  |
+| reply | runner reply (PWRunnerRunResult) | record | the host | response schema; shape golden | [`PWRunnerRunResult`](../runner/Sources/PWRunnerCore/PWRunnerAPI.swift); [`PWContract`](../runner/Sources/PWRunnerCore/PWRunnerAPI.swift) | [`replyShapeDocuments`](../runner/Tests/PWRunnerCoreTests/ContractVersionTests.swift); [`schema_version`](../tests/fixtures/contract/response_shape.json) |  |
+| profile_capture | compiled-object receipt (compiled_profile) | record | the worker, before apply; admitted by the host | opt-in copy of the compiled object with a nonce; CompiledProfileCapture names the worker producer and before_apply stage under its own schema_version | [`pw_capture_profile`](../controller/tools/pw_probe_runner/pw_probe_runner.c); [`CompiledProfileCapture`](../runner/Sources/PWRunnerCore/PWRunnerAPI.swift) | [`runCompiledProfileCaptureTests`](../runner/Tests/PWRunnerCoreTests/CompiledProfileCaptureTests.swift) |  |
+| envelope | controller envelope (kind run) | record | the controller | envelope frame; shape golden | [`SCHEMA_VERSION`](../controller/src/json_contract.rs); [`render_envelope`](../controller/src/json_contract.rs); [`complete_execution`](../controller/src/run_flow.rs) | [`envelope_shape_golden_agrees_with_the_manifest`](../controller/src/run_flow.rs); [`_validate_observer_reply`](../tests/lib/consumer.py); [`observer_admission_precedes_all_body_interpretation`](../controller/src/sandbox_log.rs); [`observer_controls`](../tests/suites/blackbox_e2e/checker_controls.py) |  |
+| observer_report | observer report (nested envelope) | record | the observer | envelope frame; its own observer_schema_version (OBSERVER_SCHEMA_VERSION) inside | [`OBSERVER_SCHEMA_VERSION`](../controller/src/bin/sandbox-log-observer.rs) | [`parsed_event_retains_pid_operation_and_raw_line_without_temporal_claims`](../controller/src/bin/sandbox-log-observer.rs); [`checked_reads`](../tests/suites/witness_contract/check_deny_capture_window.py) |  |
+| helper_envelope | sbpl-check envelope (nested) | record | sbpl-check | envelope frame; kind sbpl_check | [`run_policy_check`](../controller/src/policy_check.rs); [`sandbox_compile_string`](../controller/src/bin/sbpl-check.rs) | [`_validate_policy_check_reply`](../tests/lib/consumer.py); [`policy_check_controls`](../tests/suites/blackbox_e2e/checker_controls.py) |  |
+| evidence_manifest | evidence manifest (in the app) | record | the build | hashes and entitlements of every shipped binary; its own schema_version (EVIDENCE_SCHEMA_VERSION) | [`manifest.json`](../tests/build-evidence.py); [`EVIDENCE_SCHEMA_VERSION`](../controller/src/evidence.rs) | [`codesign.preflight`](../tests/suites/preflight/run.sh); [`dossier_witness`](../tests/suites/witness_contract/dossier_witness.sh) |  |
+| runner_registry | runner registry (BYOXPC installs) | record | the runner commands | additive-field loader; retired kind aliases kept for recovery; its own schema_version (RUNNER_REGISTRY_SCHEMA_VERSION) | [`load_registry`](../controller/src/runner_manager.rs); [`RUNNER_REGISTRY_SCHEMA_VERSION`](../controller/src/runner_manager.rs); [`alias = "machme"`](../controller/src/runner_manager.rs) | [`legacy_machme_kind_deserializes_as_byoxpc`](../controller/src/runner_manager.rs); [`runner_install`](../tests/suites/runner_byoxpc/run.sh) |  |
+| extension_preparation | extension declaration and preparation | record | host; submitted references and paths remain distinct from observations | bounded references, realpath result and metadata before issuer launch | [`extensionMeaningFailure`](../runner/Sources/PWRunnerCore/ProbeRunner.swift); [`realpath`](../runner/Sources/PWRunnerCore/ExtensionIssuer.swift) | [`run_targets`](../tests/suites/witness_contract/check_extensions.py); [`runRequestContractTests`](../runner/Tests/PWRunnerCoreTests/RequestContractTests.swift) |  |
+| token_channel | transient token channel | record | host owns mapping; issuer writes token/publication; worker consumes and erases | separate bounded shared mapping; inherited descriptors closed after mapping; never retained JSON | [`PWExtensionLayout`](../runner/Sources/PWRunnerCore/ExtensionIssuer.swift); [`extension_channel`](../controller/tools/pw_probe_runner/pw_probe_runner.c) | [`c_swift_layout_agreement`](../tests/suites/runner_abi_layout/run.sh); [`run_case`](../tests/suites/witness_contract/check_extension_boundaries.py); [`runExtensionEvidenceTests`](../runner/Tests/PWRunnerCoreTests/ExtensionEvidenceTests.swift); [`check_row`](../tests/suites/witness_contract/check_extension_combinations.py) |  |
+
+#### Boundaries and their guards edges
+
+| Id | From | To | Kind | Edge | Sources | Checks | Limits |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| B1 | request_file | held_request | guard | request version gate; selector parse; augment resolution | [`validate_request_version`](../controller/src/request_patch.rs); [`parse_runner_selector_value`](../controller/src/runner_select.rs); [`pub fn resolve_augments`](../controller/src/augments.rs) | [`invalid_request_version_stops_before_selection_augments_or_client_invocation`](../controller/src/run_flow.rs); [`accepted_input_contract`](../tests/suites/runner_outcome_bad_request/run.sh) |  |
+| B2 | held_request | run_spec | guard | caller authorization; closed-key decode; capacity, then meaning; policy hash | [`authorizedCaller`](../runner/Sources/PWRunnerCore/PWRunnerService.swift); [`CodingKeys`](../runner/Sources/PWRunnerCore/PWRunnerAPI.swift); [`admissionFailure(for`](../runner/Sources/PWRunnerCore/CWorkerOrchestrator.swift); [`requestMeaningFailure`](../runner/Sources/PWRunnerCore/ProbeRunner.swift); [`computePolicyHash`](../runner/Sources/PWRunnerCore/SandboxApply.swift) | [`admission`](../tests/suites/failure_boundaries/check.py); [`runEnvelopeInvariantTests`](../runner/Tests/PWRunnerCoreTests/EnvelopeInvariantTests.swift) |  |
+| B3 | run_spec | shm_region | guard | host writes identity, counts, phase partitions, the expected policy length and slots; worker refuses mismatched identity, invalid partition, an expectation the source buffer cannot hold, or an unusable timebase or allowance before any policy byte | [`abiIdentityHex`](../runner/Sources/PWRunnerCore/CWorker.swift); [`PW_WORKER_ABI_IDENTITY`](../controller/tools/pw_probe_runner/pw_probe_runner.c); [`return 4`](../controller/tools/pw_probe_runner/pw_probe_runner.c); [`SOURCE_DIRS`](../docs/generate_worker_identity.py); [`PW_FAILURE_LENGTH_EXPECTATION`](../controller/tools/pw_probe_runner/pw_probe_runner.c); [`pw_timing_setup`](../controller/tools/pw_probe_runner/pw_probe_runner.c) | [`c_swift_layout_agreement`](../tests/suites/runner_abi_layout/run.sh); [`independent_worker_and_host_queries`](../tests/suites/runner_live_worker_identity/run.sh); [`exec_control_states`](../tests/suites/runner_c_worker_harness/run.sh); [`runPhaseProtocolTests`](../runner/Tests/PWRunnerCoreTests/PhaseProtocolTests.swift); [`policy_expectation_out_of_range_refused`](../tests/suites/runner_c_worker_harness/run.sh); [`clock_arithmetic`](../tests/suites/runner_c_worker_harness/run.sh) |  |
+| B4 | shm_region | reply | guard | per-phase release/acquire publication; exact ordinal before actions after a validated continuous-time decision; disposition from raw facts; collection status agrees with validator observations; native result publication and fresh-read consistency before claims | [`wait_for_proceed`](../controller/tools/pw_probe_runner/pw_probe_runner.c); [`pw_clock_sample`](../controller/tools/pw_probe_runner/pw_probe_runner.c); [`proceedOffset`](../runner/Sources/PWRunnerCore/CWorker.swift); [`PWRunnerOrdering`](../runner/Sources/PWRunnerCore/CWorkerOrchestrator.swift); [`extensionEvidenceProblem`](../runner/Sources/PWRunnerCore/PWRunnerAPI.swift); [`collectionEvidenceConsistent`](../runner/Sources/PWRunnerCore/PWRunnerAPI.swift); [`publish_done_and_exit`](../controller/tools/pw_probe_runner/pw_probe_runner.c); [`observeAcknowledgement`](../runner/Sources/PWRunnerCore/CWorker.swift) | [`signal_while_waiting`](../runner/Tests/PWRunnerCoreTests/OrderingTests.swift); [`order_barrier_mutations`](../tests/suites/witness_contract/opt_in/mutations.sh); [`runPhaseProtocolTests`](../runner/Tests/PWRunnerCoreTests/PhaseProtocolTests.swift); [`runExtensionEvidenceTests`](../runner/Tests/PWRunnerCoreTests/ExtensionEvidenceTests.swift); [`phase_collection_states_gate_disposition_without_requiring_success`](../controller/src/disposition.rs); [`run_extension_controls`](../tests/suites/blackbox_e2e/extension_controls.py); [`proceed_precedence`](../tests/suites/runner_c_worker_harness/run.sh); [`runWorkerClockTests`](../runner/Tests/PWRunnerCoreTests/WorkerClockTests.swift); [`terminal_exit_without_request`](../tests/suites/runner_c_worker_harness/run.sh); [`runCWorkerLifecycleTests`](../runner/Tests/PWRunnerCoreTests/CWorkerLifecycleTests.swift) |  |
+| B5 | run_spec | validator_wire | guard | fresh phase planning; bounded strict NDJSON decode; unique step association within the phase | [`planValidatorQueries`](../runner/Sources/PWRunnerCore/CWorkerOrchestrator.swift); [`decodeValidatorFrames`](../runner/Sources/PWRunnerCore/ValidatorClient.swift) | [`predictions_do_not_report`](../tests/suites/validator_batch_mode/run.sh); [`transcript_controls`](../tests/suites/runner_validator_failure/run.sh); [`runPhaseProtocolTests`](../runner/Tests/PWRunnerCoreTests/PhaseProtocolTests.swift) |  |
+| B6 | validator_wire | reply | guard | verdict joined only to its phase and step, or explicit unavailable prediction | [`ComparisonEvidence`](../runner/Sources/PWRunnerCore/CWorkerOrchestrator.swift); [`sb_api_validator_verdict`](../runner/Sources/PWRunnerCore/ValidatorClient.swift) | [`transcript_controls`](../tests/suites/runner_validator_failure/run.sh); [`happy_default_allow`](../tests/suites/runner_use_c_worker/run.sh); [`runPhaseProtocolTests`](../runner/Tests/PWRunnerCoreTests/PhaseProtocolTests.swift) |  |
+| B7 | reply | envelope | guard | exact response version; disposition validated and projected; reply retained unread when refused | [`reply_version`](../controller/src/run_flow.rs); [`complete_execution`](../controller/src/run_flow.rs); [`execution_diagnostics`](../controller/src/disposition.rs); [`validate_disposition`](../controller/src/disposition.rs) | [`reply_versions_are_gated_exactly`](../controller/src/run_flow.rs); [`rust_wrapper_controls`](../tests/suites/blackbox_e2e/disposition_controls.py) |  |
+| B8 | observer_report | envelope | guard | nested unchanged; log evidence never changes execution evidence | [`attach_sandbox_logs`](../controller/src/run_flow.rs); [`admitted_observer`](../controller/src/sandbox_log.rs); [`OBSERVER_SCHEMA_VERSION`](../controller/src/bin/sandbox-log-observer.rs) | [`collector_states_preserve_the_serialized_execution_half`](../controller/src/run_flow.rs); [`phased_collector_states_preserve_execution_and_ambiguous_candidates`](../controller/src/run_flow.rs); [`worker_termination_and_log_correlation`](../tests/suites/witness_contract/worker_termination_and_log_correlation.sh); [`_validate_observer_reply`](../tests/lib/consumer.py); [`observer_admission_precedes_all_body_interpretation`](../controller/src/sandbox_log.rs); [`observer_controls`](../tests/suites/blackbox_e2e/checker_controls.py) |  |
+| B9 | helper_envelope | envelope | guard | nested unchanged; admitted by kind and frame version | [`fallback_policy_check`](../controller/src/run_flow.rs); [`_validate_policy_check_reply`](../tests/lib/consumer.py) | [`fallback_compilation_is_requested_only_for_an_admitted_xpc_error`](../controller/src/run_flow.rs); [`policy_check_controls`](../tests/suites/blackbox_e2e/checker_controls.py) |  |
+| B10 | evidence_manifest | envelope | guard | dossier compares selected binaries with manifest baselines; lookup by exact path and kind | [`unique_typed_entry`](../controller/src/evidence.rs); [`pub struct Binaries`](../controller/src/dossier.rs) | [`codesign.preflight`](../tests/suites/preflight/run.sh); [`dossier_witness`](../tests/suites/witness_contract/dossier_witness.sh) |  |
+| B11 | runner_registry | held_request | guard | selection resolves a BYOXPC target; selector fields stripped before XPC | [`resolve_runner_target_with_registry`](../controller/src/runner_select.rs); [`strip_runner_selector`](../controller/src/runner_select.rs); [`load_registry`](../controller/src/runner_manager.rs) | [`legacy_machme_kind_deserializes_as_byoxpc`](../controller/src/runner_manager.rs); [`runner_install`](../tests/suites/runner_byoxpc/run.sh) |  |
+| B12 | profile_capture | reply | guard | admitted only after successful application, worker completion, PID, nonce, input identity and payload integrity checks | [`decodeProfileCapture`](../runner/Sources/PWRunnerCore/CWorker.swift) | [`runCompiledProfileCaptureTests`](../runner/Tests/PWRunnerCoreTests/CompiledProfileCaptureTests.swift) |  |
+| B13 | run_spec | extension_preparation | guard | explicit phases, declaration/action caps, reference order and exec exclusion before preparation | [`extensionMeaningFailure`](../runner/Sources/PWRunnerCore/ProbeRunner.swift); [`requestAdmissionFailure`](../runner/Sources/PWRunnerCore/CWorkerOrchestrator.swift) | [`runRequestContractTests`](../runner/Tests/PWRunnerCoreTests/RequestContractTests.swift); [`run_targets`](../tests/suites/witness_contract/check_extensions.py) | [`extension_consumes`](LIMITS.md#specimen-admission); [`extension_declarations`](LIMITS.md#specimen-admission); [`extension_reference`](LIMITS.md#specimen-admission); [`extension_releases`](LIMITS.md#specimen-admission); [`extension_target`](LIMITS.md#specimen-admission) |
+| B14 | extension_preparation | token_channel | guard | resolved target and metadata before native issuance; clean issuer reap and bounded publication before worker delivery | [`ExtensionSession`](../runner/Sources/PWRunnerCore/ExtensionIssuer.swift); [`PW_EXTENSION_TOKEN_BYTES`](../controller/tools/pw_probe_runner/pw_extension_issuer.c) | [`run_targets`](../tests/suites/witness_contract/check_extensions.py); [`run_case`](../tests/suites/witness_contract/check_extension_boundaries.py); [`runExtensionEvidenceTests`](../runner/Tests/PWRunnerCoreTests/ExtensionEvidenceTests.swift); [`check_row`](../tests/suites/witness_contract/check_extension_combinations.py) |  |
+| B15 | token_channel | shm_region | channel | worker receives transient token separately; publishes delivery and ordered consume/release facts in evidence slots | [`sandbox_extension_consume`](../controller/tools/pw_probe_runner/pw_probe_runner.c); [`sandbox_extension_release`](../controller/tools/pw_probe_runner/pw_probe_runner.c); [`erase_accepted_token`](../controller/tools/pw_probe_runner/pw_probe_runner.c) | [`run_case`](../tests/suites/witness_contract/check_extension_boundaries.py); [`run_targets`](../tests/suites/witness_contract/check_extensions.py); [`check_row`](../tests/suites/witness_contract/check_extension_combinations.py); [`terminal_erasure`](../tests/suites/runner_c_worker_harness/run.sh) |  |
+| B16 | extension_preparation | reply | writes | preparation, authority and native issuer/cleanup observations without token bytes | [`PWRunnerExtensionRecord`](../runner/Sources/PWRunnerCore/PWRunnerAPI.swift); [`record`](../runner/Sources/PWRunnerCore/ExtensionIssuer.swift) | [`runExtensionEvidenceTests`](../runner/Tests/PWRunnerCoreTests/ExtensionEvidenceTests.swift); [`run_targets`](../tests/suites/witness_contract/check_extensions.py) |  |
+
+Notes:
+
+- `B4`: Terminal publication erases accepted token storage, releases done and exits. The host retains its mapping and reconciles acknowledgement after confirmed reap only while ownership through acknowledgement remains established, including abnormal exit without done. Poll stop, deadline and disposition remain independent.
+- `B8`: The receiver admits the exact kind, outer envelope version and inner report version before interpretation. Rejected JSON remains opaque; independent transport and execution evidence survive.
+- `B13`: Declaration count 1 item; consume count 1 item; release count 1 item; references 63 UTF-8 bytes; target 1,023 UTF-8 bytes.
+- `B15`: Accepted token storage is erased on ordinary departures and before done; erasure does not invoke native release. Fatal interruption need not reach worker cleanup. Host erasure is a separate observation.
+
+Every node and edge above cites at least one test or rule.
+
+</details>
+<!-- END GENERATED ARCHITECTURE GRAPH boundaries -->
+
+The validator receiver checks an exact kind and schema marker, bounded frames
+and strings, and per-query byte and record allowances before association. A
+rejected frame retains bounded context and prior complete records. Co-shipping
+and the worker source identity do not authenticate a validator selected through
+a test seam; its observations and process disposition remain explicit.
+
+The nested envelopes (`data.policy_check.envelope`,
+`data.sandbox_log_capture.observer` and the controller's own) share the
+[envelope frame](CONTRACT.md#what-each-number-identifies), so one version
+number covers the controller family, and the observer's report carries its
+own number inside the frame.
+
+The observer receiver in [sandbox_log.rs](../controller/src/sandbox_log.rs)
+admits `sandbox_log_observer_report`, the exact envelope version and the
+supported inner report version before reading report semantics. Rejected
+JSON remains under `observer` as opaque evidence. An intact, completely
+delivered rejected report yields `invalid_reply`; independent transport
+failure keeps its own precedence. No rejected body supplies events, blocked
+reasons, correlation or missing-record conclusions. Rust receiver/assembly
+controls and Python consumer controls check these boundaries while preserving
+serialized execution fields. The helper receiver follows its corresponding
+kind/version gate in [policy_check.rs](../controller/src/policy_check.rs).
+
+## How the system verifies itself
+
+The suites are listed in [tests/README.md](../tests/README.md#suite-coverage);
+this section names the mechanisms they are built from.
+
+- **Goldens.** `response_shape.json` and `envelope_shape.json` under
+  `tests/fixtures/contract/` record every key a reply or envelope can carry
+  and its type, collected from field-complete fixtures; they are also the
+  readers' allowlists. `abi_layout.txt` is the compiled harvest of the
+  worker ABI's sizes and offsets. A difference writes a candidate; replacing
+  the golden with the reviewed candidate is the acknowledgement
+  ([shape goldens](CONTRACT.md#shape-goldens)).
+- **Generators with marked regions.**
+  The <!-- span architecture.documents.kinds.manifest -->8<!-- /span --> manifest
+  nodes of the document graph, from the wire numbers to the prose baseline,
+  are hand-owned facts, and the identity is digested from the sources
+  themselves.
+  The <!-- span architecture.documents.kinds.generator -->6<!-- /span --> generator
+  nodes, one of them the shared module, copy manifest facts into marked
+  regions of documents and sources, render counts and limit values into
+  inline spans, and resolve limit placeholders in the architecture facts;
+  the build runs every generator's check before signing. Every check
+  citation carries a form, and the generator verifies the definition behind
+  a test. Prose that still states a value, a count or a citation outside
+  these mechanisms is listed in the
+  [prose baseline](../tests/fixtures/docs/prose_baseline.json), which grows
+  only by an explicit entry and which a release cannot grow. These documentation
+  input manifests feed build-time checks. The embedded evidence manifest is read
+  by the controller during a run, as the
+  [run inventory](../controller/README.md#what-a-run-reads-and-launches) describes.
+- **Source-drift rules.** Mechanical checks over text that is not generated,
+  from the host invariance rule to the harness note's copies. Each rule is a
+  citation of the drift node in the document graph, and a test holds that
+  list equal to the rules the script runs.
+- **The consumer.** [consumer.py](../tests/lib/consumer.py) gates an
+  envelope on exact versions, validates every step against its raw channel
+  fields through the goldens, and selects steps by field; it is the reader
+  the suites share and the reader an external consumer is expected to copy.
+- **Request-exposed test controls.** `_test_overrides` can select deadlines,
+  hangs, a self-signal, and replacement worker, validator or issuer executables.
+  Supplied controls are echoed when available, subject to refusal sanitization;
+  an echo does not prove that execution reached the selected boundary. The supported
+  keys are the table in [runner/README.md](../runner/README.md), locked to
+  the Swift type by a drift rule, and the assertion recipe is in
+  [runner/AGENTS.md](../runner/AGENTS.md). Direct driver tests also inject process
+  calls, and [native extension fixtures](../tests/fixtures/extension_controls/README.md)
+  instrument separately compiled helpers; these are distinct test boundaries.
+- **The C harness.** `runner_c_worker_harness` drives the real worker
+  through the shared-memory ABI from a C program with no host, so the
+  worker's publication and failure paths are pinned independently of the
+  Swift driver.
+- **The lifecycle oracle.** [lifecycle_oracle.py](../tests/lib/lifecycle_oracle.py)
+  constructs envelopes from worker records and raw facts and checks that the
+  disposition projection says only what those facts support, with disabled
+  log fields so no log evidence can decide a lifecycle claim.
+- **The dispatcher's artifact check.** Before any app-dependent case runs,
+  the dispatcher verifies the bundle layout against `EXECUTABLES`, the
+  signatures, the embedded evidence hashes and the host's undefined symbols;
+  fixture bundles with a damaged seal or a sandbox-importing host prove the
+  check refuses them.
+
+The last figure is the graph those generators and rules draw over the
+documents: which manifest feeds which generator, which regions it writes,
+which copies a rule keeps equal, and where the build runs the checks.
+
+<!-- BEGIN GENERATED ARCHITECTURE GRAPH documents -->
+![The document graph](architecture-documents.svg)
+
+*Figure: the document graph. Generated from [architecture.json](architecture.json) by [generate_architecture.py](generate_architecture.py); dot source in [architecture-documents.dot](architecture-documents.dot). The ids in the figure are the ids in the tables below, and each row cites the source symbol that implements it and the test or rule the manifest names for it. Symbol presence and test definition are verified; whether a test asserts the row is not verified.*
+
+<details>
+<summary>The document graph: 47 nodes and 70 edges, with symbol presence and test definition verified; whether a test asserts the row is not verified</summary>
+
+#### The document graph nodes
+
+| Id | Node | Kind | Owns | Carries | Guards | Sources | Checks | Limits |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| contract_json | docs/contract.json | manifest | the request, response and envelope version numbers |  |  | [`controller_envelope`](../docs/contract.json) | [`test_every_generated_copy_is_current`](../tests/suites/source_drift/contract.py) |  |
+| limits_json | docs/limits.json | manifest | every runtime limit with its source and check citations |  |  | [`schema_version`](../docs/limits.json) | [`test_document_is_current`](../tests/suites/source_drift/limits.py) |  |
+| matrix_json | tests/fixtures/comparison/matrix.json | manifest | the comparison scenario matrix |  |  | [`observation`](../tests/fixtures/comparison/matrix.json) | [`test_document_is_current`](../tests/suites/source_drift/limits.py) |  |
+| architecture_json | docs/architecture.json | manifest | the nodes and edges of these figures, each with its citations |  |  | [`MANIFEST_NAME`](../docs/generate_architecture.py) | [`test_document_and_figures_are_current`](../tests/suites/source_drift/architecture.py) |  |
+| catalog_json | tests/catalog.json | manifest | the registered suites and cases |  |  | [`"suites"`](../tests/catalog.json) | [`check_index_vs_disk`](../tests/suites/source_drift/check.py) |  |
+| gen_contract | generate_contract.py | generator | the generated contract-version regions |  |  | [`TARGETS`](../docs/generate_contract.py) | [`test_every_generated_copy_is_current`](../tests/suites/source_drift/contract.py) |  |
+| gen_limits | generate_limits.py | generator | the limits tables, the scenario matrix, the guide's copied regions and the limits spans |  |  | [`CONTRACT_NAME`](../docs/generate_limits.py) | [`test_document_is_current`](../tests/suites/source_drift/limits.py) |  |
+| gen_identity | generate_worker_identity.py | generator | the host/worker source identity regions |  |  | [`SOURCE_DIRS`](../docs/generate_worker_identity.py) | [`test_every_generated_copy_is_current`](../tests/suites/source_drift/contract.py) |  |
+| gen_architecture | generate_architecture.py | generator | these figures, their dot and SVG files, the tables beside them and the architecture spans |  |  | [`MANIFEST_NAME`](../docs/generate_architecture.py) | [`test_document_and_figures_are_current`](../tests/suites/source_drift/architecture.py) |  |
+| contract_md | docs/CONTRACT.md | document |  | the version sentence and table |  | [`BEGIN GENERATED CONTRACT VERSIONS`](../docs/CONTRACT.md) | [`test_every_generated_copy_is_current`](../tests/suites/source_drift/contract.py) |  |
+| limits_md | docs/LIMITS.md | document |  | the limits tables and coverage |  | [`BEGIN GENERATED LIMITS`](../docs/LIMITS.md) | [`test_document_is_current`](../tests/suites/source_drift/limits.py) |  |
+| guide | docs/PolicyWitness.md | document |  | copied limits, questions, reading rules and extension statuses; the version sentence; the only document that ships |  | [`BEGIN COPIED LIMITS`](../docs/PolicyWitness.md); [`BEGIN GENERATED CONTRACT VERSIONS`](../docs/PolicyWitness.md) | [`test_document_is_current`](../tests/suites/source_drift/limits.py); [`--stage-guide`](../build.sh) |  |
+| questions_md | docs/QUESTIONS.md | document |  | the shared questions the guide copies |  | [`BEGIN SHARED QUESTIONS`](../docs/QUESTIONS.md) | [`test_document_is_current`](../tests/suites/source_drift/limits.py) |  |
+| failure_contract | tests/FAILURE-PROPAGATION-CONTRACT.md | document |  | the generated scenario matrix, shared reading rules and extension statuses |  | [`BEGIN GENERATED SCENARIO MATRIX`](../tests/FAILURE-PROPAGATION-CONTRACT.md); [`BEGIN SHARED READING RULES`](../tests/FAILURE-PROPAGATION-CONTRACT.md); [`BEGIN SHARED EXTENSION STATUSES`](../tests/FAILURE-PROPAGATION-CONTRACT.md) | [`test_document_is_current`](../tests/suites/source_drift/limits.py) |  |
+| architecture_md | docs/ARCHITECTURE.md | document |  | these figures and their tables |  | [`REGION_START`](../docs/generate_architecture.py) | [`test_document_and_figures_are_current`](../tests/suites/source_drift/architecture.py) |  |
+| agents_md | AGENTS.md | document |  | repository working rules and sandbox guidance with routes to local diagnostics |  | [`Sandboxed automation harnesses`](../AGENTS.md) | [`check_harness_guidance_routes`](../tests/suites/source_drift/check.py) |  |
+| controller_readme | controller/README.md | document |  | the CLI surface block and the version sentence |  | [`CLI surface (contract)`](../controller/README.md); [`BEGIN GENERATED CONTRACT VERSIONS`](../controller/README.md) | [`check_cli_surface_agreement`](../tests/suites/source_drift/check.py) |  |
+| runner_readme | runner/README.md | document |  | the test-seam table and the version sentence |  | [`_test_overrides`](../runner/README.md); [`BEGIN GENERATED CONTRACT VERSIONS`](../runner/README.md) | [`check_test_overrides_table_agreement`](../tests/suites/source_drift/check.py) |  |
+| runner_agents | runner/AGENTS.md | document |  | runner working rules and local sandbox diagnostics |  | [`Sandboxed automation harnesses`](../runner/AGENTS.md) | [`check_harness_guidance_routes`](../tests/suites/source_drift/check.py) |  |
+| tests_readme | tests/README.md | document |  | the harness reference and suite table |  | [`Suite coverage`](../tests/README.md) | [`check_index_vs_disk`](../tests/suites/source_drift/check.py) |  |
+| tests_agents | tests/AGENTS.md | document |  | test working rules and local sandbox diagnostics |  | [`Sandboxed automation harnesses`](../tests/AGENTS.md) | [`check_harness_guidance_routes`](../tests/suites/source_drift/check.py) |  |
+| coverage_md | tests/COVERAGE.md | document |  | the outcome coverage matrices |  | [`Normalized outcome coverage matrix`](../tests/COVERAGE.md) | [`check_normalized_outcomes_have_matrix_rows`](../tests/suites/source_drift/check.py) |  |
+| api_swift | PWRunnerAPI.swift | source |  | the Swift contract versions and the outcome vocabularies |  | [`PWContract`](../runner/Sources/PWRunnerCore/PWRunnerAPI.swift); [`NormalizedOutcome`](../runner/Sources/PWRunnerCore/PWRunnerAPI.swift) | [`check_normalized_outcomes_have_matrix_rows`](../tests/suites/source_drift/check.py) |  |
+| json_contract_rs | json_contract.rs | source |  | the Rust contract versions; the envelope frame |  | [`SCHEMA_VERSION`](../controller/src/json_contract.rs) | [`test_every_generated_copy_is_current`](../tests/suites/source_drift/contract.py) |  |
+| contract_py | tests/lib/contract.py | source |  | the Python contract versions and the worker identity |  | [`CONTROLLER_ENVELOPE`](../tests/lib/contract.py) | [`test_every_generated_copy_is_current`](../tests/suites/source_drift/contract.py) |  |
+| abi_header | pw_probe_runner_abi.h | source |  | the C identity region and the shared-region layout |  | [`PW_WORKER_ABI_IDENTITY_HEX`](../controller/tools/pw_probe_runner/pw_probe_runner_abi.h) | [`c_swift_layout_agreement`](../tests/suites/runner_abi_layout/run.sh) |  |
+| cworker_swift | CWorker.swift | source |  | the Swift identity region and the layout mirror |  | [`abiIdentityHex`](../runner/Sources/PWRunnerCore/CWorker.swift) | [`c_swift_layout_agreement`](../tests/suites/runner_abi_layout/run.sh) |  |
+| cli_rs | cli.rs | source |  | the usage text the controller README mirrors |  | [`pub fn run`](../controller/src/cli.rs) | [`check_cli_surface_agreement`](../tests/suites/source_drift/check.py) |  |
+| identity_sources | worker and runner sources | source |  | every byte the identity digest covers |  | [`SOURCE_DIRS`](../docs/generate_worker_identity.py) | [`test_every_generated_copy_is_current`](../tests/suites/source_drift/contract.py) |  |
+| meson_build | meson.build | source |  | the native targets and their explicit source lists |  | [`pwrunner_core`](../meson.build) | [`check_meson_source_lists`](../tests/suites/source_drift/check.py) |  |
+| suites | tests/suites/<name>/ | source |  | one run.sh and README per suite |  | [`suites_with_run_sh`](../tests/suites/source_drift/check.py) | [`check_index_vs_disk`](../tests/suites/source_drift/check.py) |  |
+| drift_check | source_drift check.py | check |  |  | copies and vocabularies that are not generated, workflow guidance sections and diagnostic routes, the Known gap indexes in the architecture, build and worker tours, and the evidence-channel landing paths | [`check_harness_guidance_routes`](../tests/suites/source_drift/check.py) | [`check_readmes_present`](../tests/suites/source_drift/check.py); [`check_index_vs_disk`](../tests/suites/source_drift/check.py); [`check_baseline_in_catalog_defaults`](../tests/suites/source_drift/check.py); [`check_runner_outcome_suites_have_matrix_rows`](../tests/suites/source_drift/check.py); [`check_normalized_outcomes_have_matrix_rows`](../tests/suites/source_drift/check.py); [`check_attempt_outcomes_have_matrix_rows`](../tests/suites/source_drift/check.py); [`check_attempt_kind_enum_agreement`](../tests/suites/source_drift/check.py); [`check_prediction_unavailable_agreement`](../tests/suites/source_drift/check.py); [`check_prediction_unavailable_planner`](../tests/suites/source_drift/check.py); [`check_test_overrides_table_agreement`](../tests/suites/source_drift/check.py); [`check_harness_guidance_routes`](../tests/suites/source_drift/check.py); [`check_cli_surface_agreement`](../tests/suites/source_drift/check.py); [`check_host_invariance`](../tests/suites/source_drift/check.py); [`check_known_gap_index`](../tests/suites/source_drift/check.py); [`check_evidence_channel_paths`](../tests/suites/source_drift/check.py); [`check_meson_source_lists`](../tests/suites/source_drift/check.py); [`runner_source_manifests_agree`](../tests/suites/source_drift/run.sh) |  |
+| drift_limits | source_drift limits.py | check |  |  | the limits generator's copies and every local documentation link | [`broken_links`](../tests/suites/source_drift/generators.py) | [`test_document_is_current`](../tests/suites/source_drift/limits.py) |  |
+| drift_contract | source_drift contract.py | check |  |  | the contract and identity generators' copies | [`ContractVersionTests`](../tests/suites/source_drift/contract.py) | [`contract_versions`](../tests/suites/source_drift/run.sh) |  |
+| drift_architecture | source_drift architecture.py | check |  |  | this manifest against its dot, SVG and document copies | [`ArchitectureDocumentationTests`](../tests/suites/source_drift/architecture.py) | [`architecture_documentation`](../tests/suites/source_drift/run.sh) |  |
+| gen_common | generator_common.py | generator | the citation forms, the duration pattern, the limits formatter and the span rules the three document generators share |  |  | [`FORM_RULES`](../docs/generator_common.py); [`render_spans`](../docs/generator_common.py) | [`test_check_citations_carry_a_form_and_tests_are_defined`](../tests/suites/source_drift/generators.py); [`test_readme_form_table_is_a_copy_of_the_shared_rules`](../tests/suites/source_drift/generators.py) |  |
+| prose_baseline | tests/fixtures/docs/prose_baseline.json | manifest | every prose site that still states a value, a count or a citation in an unverified form |  |  | [`BASELINE_NAME`](../tests/suites/source_drift/generators.py) | [`test_prose_baseline_is_consistent_and_growth_is_explicit`](../tests/suites/source_drift/generators.py) |  |
+| drift_generators | source_drift generators.py | check |  |  | the uniform generator invariants, the baseline's consistency, the drift node's rule list and the form table's copy | [`GeneratorContractTests`](../tests/suites/source_drift/generators.py) | [`generator_contract`](../tests/suites/source_drift/run.sh) |  |
+| preflight | release_preflight.py | check |  |  | the baseline against the previous release tag | [`inspect_baseline`](../tests/lib/release_preflight.py) | [`test_release_preflight_refuses_a_grown_baseline`](../tests/suites/source_drift/generators.py) |  |
+| build | build.sh | check |  |  | checks the generated copies, selects the SDK, refuses a build directory configured for another checkout, compiles the native executables through Meson, checks the configured source lists against the tree and every output's minimum version, assembles and signs the bundle, checks every executable's signer and stages the guide | [`generate_worker_identity.py`](../build.sh); [`MESON_SOURCE_DIR`](../build.sh); [`meson compile`](../build.sh); [`native_sources.py`](../build.sh); [`check_minimum_macos`](../build.sh); [`signer_check.py`](../build.sh); [`--stage-guide`](../build.sh) | [`test_document_is_current`](../tests/suites/source_drift/limits.py); [`problems`](../tests/lib/native_sources.py) |  |
+| build_json | docs/build.json | manifest | the build's steps, refusals, knobs, signing list, helper invocations and directories, each with its citations |  |  | [`MANIFEST_NAME`](../docs/generate_build.py) | [`test_document_and_figure_are_current_and_the_rules_agree`](../tests/suites/source_drift/build.py) |  |
+| gen_build | generate_build.py | generator | the build figure, its dot and SVG files, the five build tables and the build spans; refuses a manifest that disagrees with build.sh |  |  | [`parse_script`](../docs/generate_build.py) | [`test_document_and_figure_are_current_and_the_rules_agree`](../tests/suites/source_drift/build.py) |  |
+| build_md | docs/BUILD.md | document |  | the build figure and tables; local signing and compiler-discovery diagnostics |  | [`REGION_START`](../docs/generate_build.py) | [`test_document_and_figure_are_current_and_the_rules_agree`](../tests/suites/source_drift/build.py) |  |
+| build_baseline | tests/fixtures/docs/build_baseline.json | manifest | every build refusal that no behavioral or helper control produces, with the control that would |  |  | [`BASELINE_NAME`](../docs/generate_build.py) | [`check_baseline`](../tests/suites/source_drift/build_rules.py) |  |
+| drift_build | source_drift build.py | check |  |  | the build manifest against build.sh, meson.build, the Makefile, the inventories and the baseline, and its copies | [`BuildDocumentationTests`](../tests/suites/source_drift/build.py) | [`build_documentation`](../tests/suites/source_drift/run.sh) |  |
+| worker_md | docs/WORKER.md | document |  | resource inventory, capability figure and tables |  | [`SPAN_DOCUMENTS`](../docs/generate_architecture.py) | [`test_routing_and_second_document_refusals`](../tests/suites/source_drift/architecture.py) |  |
+| markdown_reader | markdown_reader.py | library | the only import of the vendored markdown-it-py 3.0.0 and mdurl 0.1.2, and the Markdown structure the generators and checks read: blocks, headings and anchors, sections, links, inline code, list items and table cells |  |  | [`PARSER`](../docs/markdown_reader.py); [`__version__ = "3.0.0"`](../tests/lib/vendor/markdown_it/__init__.py) | [`markdown_reader`](../tests/suites/source_drift/run.sh); [`test_vendored_files_are_the_wheels_bytes`](../tests/suites/source_drift/markdown.py); [`test_only_the_reader_imports_the_parser`](../tests/suites/source_drift/markdown.py) |  |
+
+#### The document graph edges
+
+| Id | From | To | Kind | Edge | Sources | Checks | Limits |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| D1 | contract_json | gen_contract | reads | version numbers | [`TARGETS`](../docs/generate_contract.py) | [`test_every_generated_copy_is_current`](../tests/suites/source_drift/contract.py) |  |
+| D2 | gen_contract | contract_md | writes | version sentence and table | [`TARGETS`](../docs/generate_contract.py) | [`test_every_generated_copy_is_current`](../tests/suites/source_drift/contract.py) |  |
+| D3 | gen_contract | api_swift | writes | PWContract | [`TARGETS`](../docs/generate_contract.py) | [`test_every_generated_copy_is_current`](../tests/suites/source_drift/contract.py) |  |
+| D4 | gen_contract | json_contract_rs | writes | SCHEMA_VERSION and the schema constants | [`TARGETS`](../docs/generate_contract.py) | [`test_every_generated_copy_is_current`](../tests/suites/source_drift/contract.py) |  |
+| D5 | gen_contract | contract_py | writes | version constants | [`TARGETS`](../docs/generate_contract.py) | [`test_every_generated_copy_is_current`](../tests/suites/source_drift/contract.py) |  |
+| D6 | gen_contract | guide | writes | version sentence | [`TARGETS`](../docs/generate_contract.py) | [`test_every_generated_copy_is_current`](../tests/suites/source_drift/contract.py) |  |
+| D7 | gen_contract | runner_readme | writes | version sentence | [`TARGETS`](../docs/generate_contract.py) | [`test_every_generated_copy_is_current`](../tests/suites/source_drift/contract.py) |  |
+| D8 | gen_contract | controller_readme | writes | version sentence | [`TARGETS`](../docs/generate_contract.py) | [`test_every_generated_copy_is_current`](../tests/suites/source_drift/contract.py) |  |
+| D9 | limits_json | gen_limits | reads | limits with citations | [`load_limits`](../docs/generate_limits.py) | [`test_document_is_current`](../tests/suites/source_drift/limits.py) |  |
+| D10 | matrix_json | gen_limits | reads | scenario rows | [`MATRIX_NAME`](../docs/generate_limits.py) | [`test_document_is_current`](../tests/suites/source_drift/limits.py) |  |
+| D11 | questions_md | gen_limits | reads | shared questions | [`QUESTIONS_START`](../docs/generate_limits.py) | [`test_document_is_current`](../tests/suites/source_drift/limits.py) |  |
+| D12 | failure_contract | gen_limits | reads | shared reading rules and extension statuses | [`RULES_START`](../docs/generate_limits.py); [`EXTENSION_START`](../docs/generate_limits.py) | [`test_document_is_current`](../tests/suites/source_drift/limits.py); [`test_extension_statuses_are_complete_and_copied_from_the_contract`](../tests/suites/source_drift/limits.py) |  |
+| D13 | gen_limits | failure_contract | writes | scenario matrix | [`MATRIX_START`](../docs/generate_limits.py) | [`test_document_is_current`](../tests/suites/source_drift/limits.py) |  |
+| D14 | gen_limits | limits_md | writes | limits tables and coverage | [`COVERAGE_START`](../docs/generate_limits.py) | [`test_document_is_current`](../tests/suites/source_drift/limits.py) |  |
+| D15 | gen_limits | guide | writes | copied limits, questions, reading rules and extension statuses; staged copy at build | [`GUIDE_START`](../docs/generate_limits.py); [`--stage-guide`](../build.sh); [`GUIDE_EXTENSION_START`](../docs/generate_limits.py) | [`test_document_is_current`](../tests/suites/source_drift/limits.py) |  |
+| D16 | identity_sources | gen_identity | reads | sorted paths and contents, length-framed | [`SOURCE_DIRS`](../docs/generate_worker_identity.py) | [`test_every_generated_copy_is_current`](../tests/suites/source_drift/contract.py) |  |
+| D17 | gen_identity | abi_header | writes | identity bytes | [`TARGETS`](../docs/generate_worker_identity.py) | [`test_every_generated_copy_is_current`](../tests/suites/source_drift/contract.py) |  |
+| D18 | gen_identity | cworker_swift | writes | identity bytes | [`TARGETS`](../docs/generate_worker_identity.py) | [`test_every_generated_copy_is_current`](../tests/suites/source_drift/contract.py) |  |
+| D19 | gen_identity | contract_py | writes | identity hex | [`TARGETS`](../docs/generate_worker_identity.py) | [`test_every_generated_copy_is_current`](../tests/suites/source_drift/contract.py) |  |
+| D20 | architecture_json | gen_architecture | reads | nodes, edges, styles and citations | [`load_manifest`](../docs/generate_architecture.py) | [`test_document_and_figures_are_current`](../tests/suites/source_drift/architecture.py) |  |
+| D21 | gen_architecture | architecture_md | writes | figure regions; dot and stamped SVG files beside the document | [`expected_outputs`](../docs/generate_architecture.py); [`render_region`](../docs/generate_architecture.py); [`stamp_svg`](../docs/generate_architecture.py) | [`test_document_and_figures_are_current`](../tests/suites/source_drift/architecture.py) |  |
+| D22 | agents_md | runner_agents | links | links to workflow-local sandbox diagnostics; destination section and root route are checked | [`HARNESS_GUIDANCE_ROUTES`](../tests/suites/source_drift/check.py) | [`check_harness_guidance_routes`](../tests/suites/source_drift/check.py) |  |
+| D23 | agents_md | tests_agents | links | links to workflow-local sandbox diagnostics; destination section and root route are checked | [`HARNESS_GUIDANCE_ROUTES`](../tests/suites/source_drift/check.py) | [`check_harness_guidance_routes`](../tests/suites/source_drift/check.py) |  |
+| D24 | cli_rs | controller_readme | copies | usage text | [`check_cli_surface_agreement`](../tests/suites/source_drift/check.py) | [`check_cli_surface_agreement`](../tests/suites/source_drift/check.py) |  |
+| D25 | api_swift | coverage_md | copies | one matrix row per outcome constant | [`check_normalized_outcomes_have_matrix_rows`](../tests/suites/source_drift/check.py) | [`check_normalized_outcomes_have_matrix_rows`](../tests/suites/source_drift/check.py) |  |
+| D26 | api_swift | runner_readme | copies | test-seam table from PWRunnerTestOverrides | [`check_test_overrides_table_agreement`](../tests/suites/source_drift/check.py) | [`check_test_overrides_table_agreement`](../tests/suites/source_drift/check.py) |  |
+| D27 | suites | tests_readme | copies | one suite-table row per suite | [`check_index_vs_disk`](../tests/suites/source_drift/check.py) | [`check_index_vs_disk`](../tests/suites/source_drift/check.py) |  |
+| D28 | suites | catalog_json | copies | suite directories equal catalog suites | [`check_index_vs_disk`](../tests/suites/source_drift/check.py) | [`check_index_vs_disk`](../tests/suites/source_drift/check.py) |  |
+| D29 | drift_check | agents_md | checks | nonempty sandbox guidance sections at workflow entry points and root links to their diagnostics | [`check_harness_guidance_routes`](../tests/suites/source_drift/check.py) | [`runner_source_manifests_agree`](../tests/suites/source_drift/run.sh) |  |
+| D30 | drift_check | controller_readme | checks | CLI surface block equals cli.rs usage | [`check_cli_surface_agreement`](../tests/suites/source_drift/check.py) | [`runner_source_manifests_agree`](../tests/suites/source_drift/run.sh) |  |
+| D31 | drift_check | coverage_md | checks | every outcome constant has a row and every row a constant | [`check_normalized_outcomes_have_matrix_rows`](../tests/suites/source_drift/check.py) | [`runner_source_manifests_agree`](../tests/suites/source_drift/run.sh) |  |
+| D32 | drift_check | tests_readme | checks | suite table equals suites and catalog | [`check_index_vs_disk`](../tests/suites/source_drift/check.py) | [`runner_source_manifests_agree`](../tests/suites/source_drift/run.sh) |  |
+| D33 | drift_limits | gen_limits | checks | --check, stale-copy and staging controls; every local link in docs/*.md | [`broken_links`](../tests/suites/source_drift/generators.py) | [`limits_documentation`](../tests/suites/source_drift/run.sh) |  |
+| D34 | drift_contract | gen_contract | checks | --check and generator controls | [`ContractVersionTests`](../tests/suites/source_drift/contract.py) | [`contract_versions`](../tests/suites/source_drift/run.sh) |  |
+| D35 | drift_contract | gen_identity | checks | regeneration, relocation and stale-value controls | [`ContractVersionTests`](../tests/suites/source_drift/contract.py) | [`contract_versions`](../tests/suites/source_drift/run.sh) |  |
+| D36 | drift_architecture | gen_architecture | checks | --check, citation, stale-copy and SVG-stamp controls | [`ArchitectureDocumentationTests`](../tests/suites/source_drift/architecture.py) | [`architecture_documentation`](../tests/suites/source_drift/run.sh) |  |
+| D37 | build | gen_limits | checks | --check before compiling; --stage-guide into dist | [`--stage-guide`](../build.sh) | [`test_document_is_current`](../tests/suites/source_drift/limits.py) |  |
+| D38 | build | gen_contract | checks | --check before compiling | [`generate_contract.py`](../build.sh) | [`test_every_generated_copy_is_current`](../tests/suites/source_drift/contract.py) |  |
+| D39 | build | gen_identity | checks | --check before compiling and again before signing | [`generate_worker_identity.py`](../build.sh) | [`test_every_generated_copy_is_current`](../tests/suites/source_drift/contract.py) |  |
+| D40 | build | gen_architecture | checks | --check before compiling | [`generate_architecture.py`](../build.sh) | [`test_build_checks_every_generator_before_signing`](../tests/suites/source_drift/generators.py) |  |
+| D41 | gen_common | gen_limits | reads | shared citation, formatter and span rules | [`from generator_common import`](../docs/generate_limits.py) | [`test_limits_check_forms_and_value_owners`](../tests/suites/source_drift/generators.py) |  |
+| D42 | gen_common | gen_architecture | reads | shared citation, placeholder and span rules | [`from generator_common import`](../docs/generate_architecture.py) | [`test_check_citations_carry_a_form_and_tests_are_defined`](../tests/suites/source_drift/generators.py) |  |
+| D43 | limits_json | gen_architecture | reads | limit placeholders in facts, labels and notes, and the Limits column | [`resolve_graph`](../docs/generate_architecture.py) | [`test_durations_and_sizes_render_from_limits`](../tests/suites/source_drift/generators.py) |  |
+| D44 | drift_generators | gen_contract | checks | nothing changes outside its regions; --check before signing | [`test_regeneration_changes_nothing_outside_regions`](../tests/suites/source_drift/generators.py) | [`test_regeneration_changes_nothing_outside_regions`](../tests/suites/source_drift/generators.py) |  |
+| D45 | drift_generators | gen_identity | checks | nothing changes outside its regions; --check before signing | [`test_regeneration_changes_nothing_outside_regions`](../tests/suites/source_drift/generators.py) | [`test_regeneration_changes_nothing_outside_regions`](../tests/suites/source_drift/generators.py) |  |
+| D46 | drift_generators | gen_limits | checks | ownership, spans, forms and value owners, and whole-file staging | [`test_whole_file_staging_is_owned_and_idempotent`](../tests/suites/source_drift/generators.py) | [`test_spans_are_authored_outside_regions_and_copied_as_bytes`](../tests/suites/source_drift/generators.py) |  |
+| D47 | drift_generators | gen_architecture | checks | ownership, spans, placeholders, declared columns, captions and render refusal | [`test_architecture_render_failure_leaves_every_copy_untouched`](../tests/suites/source_drift/generators.py) | [`test_captions_state_the_verified_guarantee`](../tests/suites/source_drift/generators.py) |  |
+| D48 | drift_generators | prose_baseline | checks | the listed sites equal the scanned sites; growth only by an explicit entry | [`baseline_problems`](../tests/suites/source_drift/generators.py) | [`test_prose_baseline_is_consistent_and_growth_is_explicit`](../tests/suites/source_drift/generators.py) |  |
+| D49 | preflight | prose_baseline | checks | a release's baseline is a subset of the previous release's | [`inspect_baseline`](../tests/lib/release_preflight.py) | [`test_release_preflight_refuses_a_grown_baseline`](../tests/suites/source_drift/generators.py) |  |
+| D50 | drift_check | architecture_md | checks | Known gap paragraphs equal the index; evidence-channel paths resolve in the shape goldens | [`check_known_gap_index`](../tests/suites/source_drift/check.py); [`check_evidence_channel_paths`](../tests/suites/source_drift/check.py) | [`runner_source_manifests_agree`](../tests/suites/source_drift/run.sh) |  |
+| D51 | drift_generators | architecture_json | checks | the drift node's rule citations equal the rules check.py runs | [`test_document_graph_cites_every_drift_rule`](../tests/suites/source_drift/generators.py) | [`test_document_graph_cites_every_drift_rule`](../tests/suites/source_drift/generators.py) |  |
+| D52 | drift_check | meson_build | checks | source list equals the tree | [`check_meson_source_lists`](../tests/suites/source_drift/check.py) | [`runner_source_manifests_agree`](../tests/suites/source_drift/run.sh) |  |
+| D53 | build_json | gen_build | reads | steps, refusals, knobs, signing, invocations, directories and citations | [`load_manifest`](../docs/generate_build.py) | [`test_document_and_figure_are_current_and_the_rules_agree`](../tests/suites/source_drift/build.py) |  |
+| D54 | build | gen_build | reads | banners, refusals, signing calls, knobs and helper invocations, parsed | [`parse_script`](../docs/generate_build.py) | [`check_banner_order`](../tests/suites/source_drift/build_rules.py); [`test_script_mutations_are_named_by_their_rule`](../tests/suites/source_drift/build.py) |  |
+| D55 | gen_build | build_md | writes | figure, step, refusal, signing, knob and directory regions; dot and stamped SVG beside the document | [`render_document`](../docs/generate_build.py); [`stamp_svg`](../docs/generate_build.py) | [`test_document_and_figure_are_current_and_the_rules_agree`](../tests/suites/source_drift/build.py) |  |
+| D56 | build | gen_build | checks | --check before compiling | [`generate_build.py`](../build.sh) | [`test_build_checks_every_generator_before_signing`](../tests/suites/source_drift/generators.py) |  |
+| D57 | drift_build | gen_build | checks | --check, the ten grounding rules, parser refusals, citation, stale-copy and mutation controls | [`BuildDocumentationTests`](../tests/suites/source_drift/build.py) | [`build_documentation`](../tests/suites/source_drift/run.sh) |  |
+| D58 | drift_build | build_baseline | checks | the listed refusals equal the uncovered ones; growth only by an explicit entry, refused at release | [`baseline_problems`](../docs/generate_build.py) | [`test_release_preflight_refuses_a_grown_build_baseline`](../tests/suites/source_drift/build.py) |  |
+| D59 | gen_common | gen_build | reads | shared citation, placeholder and span rules; the architecture generator's table and stamp rendering | [`from generator_common import`](../docs/generate_build.py); [`import generate_architecture as arch`](../docs/generate_build.py) | [`test_document_and_figure_are_current_and_the_rules_agree`](../tests/suites/source_drift/build.py) |  |
+| D60 | drift_generators | gen_build | checks | nothing changes outside its regions; --check before signing; one span owner | [`test_regeneration_changes_nothing_outside_regions`](../tests/suites/source_drift/generators.py) | [`test_regeneration_changes_nothing_outside_regions`](../tests/suites/source_drift/generators.py) |  |
+| D61 | drift_check | build_md | checks | Known gap paragraphs equal the index, as in the architecture document | [`known_gap_index_problems`](../tests/suites/source_drift/check.py) | [`runner_source_manifests_agree`](../tests/suites/source_drift/run.sh) |  |
+| D62 | agents_md | build_md | links | links to workflow-local sandbox diagnostics; destination section and root route are checked | [`HARNESS_GUIDANCE_ROUTES`](../tests/suites/source_drift/check.py) | [`check_harness_guidance_routes`](../tests/suites/source_drift/check.py) |  |
+| D65 | gen_architecture | worker_md | writes | per-graph destination; capability figure and inventory beside WORKER.md | [`graph_document`](../docs/generate_architecture.py) | [`test_routing_and_second_document_refusals`](../tests/suites/source_drift/architecture.py) |  |
+| D66 | drift_check | worker_md | checks | Known gap paragraphs equal the final index in document order | [`check_known_gap_index`](../tests/suites/source_drift/check.py) | [`runner_source_manifests_agree`](../tests/suites/source_drift/run.sh) |  |
+| D67 | markdown_reader | gen_common | reads | Markdown citations and span placement | [`import markdown_reader`](../docs/generator_common.py) | [`test_markdown_citations_name_headings_heading_code_or_markers`](../tests/suites/source_drift/generators.py); [`test_a_span_marker_that_begins_a_line_is_refused`](../tests/suites/source_drift/generators.py) |  |
+| D68 | markdown_reader | gen_limits | reads | the guide's headings, rows, lists and links and the standalone refusals | [`import markdown_reader`](../docs/generate_limits.py) | [`test_constructs_in_comments_or_code_satisfy_no_structural_check`](../tests/suites/source_drift/limits.py) |  |
+| D69 | markdown_reader | gen_architecture | reads | heading anchors for figure and limit links | [`markdown_reader.slug`](../docs/generate_architecture.py) | [`test_anchors_keep_underscores_and_number_duplicates`](../tests/suites/source_drift/markdown.py) |  |
+| D70 | markdown_reader | gen_build | reads | README.md's bundle inventory and figure anchors | [`import markdown_reader`](../docs/generate_build.py) | [`test_figure_labels_links_and_paths_render_as_claimed`](../tests/suites/source_drift/build.py); [`test_meson_makefile_inventory_and_baseline_mutations_are_named`](../tests/suites/source_drift/build.py) |  |
+| D71 | markdown_reader | drift_check | reads | sections, tables, lists, links and guidance routes | [`import markdown_reader`](../tests/suites/source_drift/check.py) | [`runner_source_manifests_agree`](../tests/suites/source_drift/run.sh) |  |
+| D72 | markdown_reader | drift_generators | reads | G9 prose lines, citation pairs and G11 links | [`import markdown_reader`](../tests/suites/source_drift/generators.py) | [`test_prose_links_resolve_anchors_and_symbol_links`](../tests/suites/source_drift/generators.py); [`test_prose_baseline_is_consistent_and_growth_is_explicit`](../tests/suites/source_drift/generators.py) |  |
+
+Every node and edge above cites at least one test or rule.
+
+</details>
+<!-- END GENERATED ARCHITECTURE GRAPH documents -->
+
+## BYOXPC as a variation on launch and selection
+
+A BYOXPC runner is a copy of the XPC bundle registered as a launchd Mach
+service, in user or system scope, by the `runner` subcommands
+([controller/README.md](../controller/README.md#runner-external-runner-manager)).
+The client connects with `NSXPCConnection(machServiceName:)`. The host binds
+`NSXPCListener(machServiceName:)` and resolves its worker, validator and issuer
+relative to its own bundle, exactly as the
+built-in one does. The request names the runner through the selector fields
+the controller strips before XPC delivery, and the registry supplies the
+service name and scope. The installer signs the copy's embedded worker with
+the supplied identity and entitlements plist, the validator and issuer with the
+identity alone, then the enclosing bundle, verifies the seal recursively, and the
+registry records each binary's signature and entitlements as read back
+([`sign_install_tree`](../controller/src/runner_manager.rs), [`read_back`](../controller/src/runner_manager.rs) in
+runner_manager.rs). The dossier
+records the hashes of the bundle's service, worker, validator and issuer files as
+observed before invocation and compares them with the manifest baselines
+([`byoxpc_run_with_a_manifest_compares_the_bundle_copies_with_its_baselines`](../controller/src/run_flow.rs)
+in run_flow.rs); the
+[guide](PolicyWitness.md#the-specimen-dossier) defines how to interpret these
+pre-invocation observations. The registry is read by an additive loader
+that still accepts retired kind spellings so an old install can be listed
+and removed; recovery of a half-removed install is the
+[registry ownership](../controller/README.md#registry-ownership-and-recovery)
+procedure. Absent issuer fields in older registry records
+remain unknown; validation and removal still work. An older bundle without the
+issuer can serve ordinary specimens but receives a named capability refusal for
+extension specimens. Shared standard/BYOXPC extension and phase controls establish
+the behavior with independent binary read-back and verified owned cleanup.
+
+`--env` configures the host's launchd environment. The worker's own environment
+is unrecorded; it spawns exec children with an empty environment.
+
+The apparatus itself, from the copied bundle to the processes the policy
+reaches, has the last figure. Two of its facts are easy to miss from the
+guide's install recipe: `runner verify` sends a real request, so it consumes
+the host it reaches, and the next request meets that host's terminal claim
+or waits for the generated plist's `ThrottleInterval`
+of <!-- span limits.byoxpc_throttle_interval.value_unit -->1 second<!-- /span -->; and a
+selector's `required_entitlements` is satisfied only by keys the worker's
+read-back records with the value `true`.
+
+<!-- BEGIN GENERATED ARCHITECTURE GRAPH byoxpc -->
+![The BYOXPC apparatus](architecture-byoxpc.svg)
+
+*Figure: the byoxpc apparatus. Generated from [architecture.json](architecture.json) by [generate_architecture.py](generate_architecture.py); dot source in [architecture-byoxpc.dot](architecture-byoxpc.dot). The ids in the figure are the ids in the tables below, and each row cites the source symbol that implements it and the test or rule the manifest names for it. Symbol presence and test definition are verified; whether a test asserts the row is not verified.*
+
+<details>
+<summary>The BYOXPC apparatus: 20 nodes and 28 edges, with symbol presence and test definition verified; whether a test asserts the row is not verified</summary>
+
+#### The BYOXPC apparatus nodes
+
+| Id | Node | Kind | Role | Contents | Ownership | Behavior | Identity | Checks | Location | Lifecycle | Sources | Checks | Limits |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| user | the installer | person | a person or a harness | a bundle copy, an identity, an entitlements plist, a scope |  |  |  |  |  |  | [`Install a BYOXPC runner`](../docs/PolicyWitness.md) | [`install`](../tests/fixtures/byoxpc/session.py); [`runner_install`](../tests/suites/runner_byoxpc/run.sh) |  |
+| bundle_copy | copied XPC bundle | record |  | the host, worker, validator and issuer, each with the build's signature until the installer re-signs them; CFBundleIdentifier is the service name | the installer |  |  |  |  |  | [`Install a BYOXPC runner`](../docs/PolicyWitness.md); [`sign_macho`](../build.sh) | [`owned_bundle`](../tests/fixtures/byoxpc/session.py); [`runner_install`](../tests/suites/runner_byoxpc/run.sh) |  |
+| entitlements_plist | the installer's entitlements plist | record |  |  | the installer | the host executable and the embedded worker, the process the policy is applied to |  |  |  |  | [`--entitlements`](../controller/src/runner_commands.rs) | [`binary_entitlements`](../tests/fixtures/byoxpc/session.py); [`runner_install`](../tests/suites/runner_byoxpc/run.sh) |  |
+| install | runner install | command |  |  |  | signs the worker, validator, issuer and then the bundle, verifies the seal recursively, writes the launchd plist, bootstraps, records the runner with every binary's read-back; with --env, adds EnvironmentVariables |  |  |  |  | [`cmd_runner_install`](../controller/src/runner_commands.rs); [`--env`](../controller/src/runner_commands.rs); [`sign_install_tree`](../controller/src/runner_manager.rs) | [`runner_install`](../tests/suites/runner_byoxpc/run.sh); [`install`](../tests/fixtures/byoxpc/session.py); [`entitlement_readback`](../tests/suites/runner_byoxpc/opt_in/entitlement_readback.sh) |  |
+| signing | codesign of the bundle tree | command |  |  |  |  | the embedded worker with the identity and the supplied entitlements, the validator and issuer with the identity alone, then the enclosing bundle with the identity and the entitlements | the sealed bundle recursively (--deep --strict) before anything is recorded |  |  | [`sign_install_tree`](../controller/src/runner_manager.rs); [`codesign_sign`](../controller/src/runner_manager.rs); [`codesign_verify`](../controller/src/runner_manager.rs) | [`install_signing_signs_helpers_before_the_bundle`](../controller/src/runner_manager.rs); [`byoxpc_verification_controls`](../tests/suites/preflight/run.sh); [`binary_entitlements`](../tests/fixtures/byoxpc/session.py) |  |
+| plist | LaunchAgent or LaunchDaemon plist | record |  | MachServices, RunAtLoad, ProgramArguments with --mach-service, EnvironmentVariables from --env, ThrottleInterval of 1 second |  |  |  |  | the user's LaunchAgents or /Library/LaunchDaemons |  | [`build_launchd_plist`](../controller/src/runner_manager.rs); [`MachServices`](../controller/src/runner_manager.rs); [`EnvironmentVariables`](../controller/src/runner_manager.rs); [`launchd_plist_path`](../controller/src/runner_manager.rs); [`BYOXPC_THROTTLE_INTERVAL_SECONDS`](../controller/src/runner_manager.rs) | [`byoxpc_setup`](../tests/suites/shell_helpers/run.sh); [`runner_install`](../tests/suites/runner_byoxpc/run.sh); [`byoxpc_plist_sets_the_respawn_throttle`](../controller/src/runner_manager.rs) | [`byoxpc_throttle_interval`](LIMITS.md#execution-budgets) |
+| registry | runner registry | record |  | service name, scope, bundle path, and separate host/worker/validator/issuer signature and entitlement read-backs, each entitlement set with its keys and the keys granted (value true); absent helper observations in older records remain unknown |  |  |  |  |  | pending, installed, pending_cleanup | [`install_record`](../controller/src/runner_manager.rs); [`RunnerState`](../controller/src/runner_manager.rs); [`PendingCleanup`](../controller/src/runner_manager.rs); [`entitlements_from_codesign`](../controller/src/runner_manager.rs); [`read_back`](../controller/src/runner_manager.rs) | [`legacy_machme_kind_deserializes_as_byoxpc`](../controller/src/runner_manager.rs); [`registry_recovery`](../tests/suites/runner_byoxpc/opt_in/registry_recovery.sh); [`registry_records_without_helper_read_backs_still_load`](../controller/src/runner_manager.rs); [`registry_records_without_helper_read_backs_still_load`](../controller/src/runner_manager.rs) |  |
+| launchd | launchd | os |  |  |  | the host on demand for its Mach service |  |  |  | one launch per ThrottleInterval, 1 second in the generated plist; launchd's own default applies without the key | [`launchctl_bootstrap`](../controller/src/runner_manager.rs); [`launchctl_target`](../controller/src/runner_manager.rs) | [`pwrunner_survives_mach_service_launch`](../tests/suites/runner_mach_service_liveness/run.sh); [`service_present`](../tests/fixtures/byoxpc/session.py) | [`byoxpc_throttle_interval`](LIMITS.md#execution-budgets) |
+| host | PWRunner as a Mach service | executable |  |  |  | NSXPCListener(machServiceName:) from --mach-service | the installed identity and entitlements |  | relative to its own bundle |  | [`NSXPCListener(machServiceName:`](../runner/Services/PWRunner/main.swift); [`defaultWorkerExecutablePath`](../runner/Sources/PWRunnerCore/CWorkerOrchestrator.swift) | [`pwrunner_survives_mach_service_launch`](../tests/suites/runner_mach_service_liveness/run.sh); [`single_use`](../tests/suites/runner_byoxpc/opt_in/single_use.sh) |  |
+| client | pw-runner-client --mach-service | executable |  |  |  | NSXPCConnection(machServiceName:), with the privileged option for system scope |  |  |  |  | [`--mach-service`](../runner/Clients/PWRunnerClient/main.swift); [`--privileged`](../runner/Clients/PWRunnerClient/main.swift) | [`runner_install`](../tests/suites/runner_byoxpc/run.sh); [`retirement_and_pid_reuse_allow_only_a_fresh_attempt_with_remaining_budget`](../controller/src/runner_acquisition.rs) |  |
+| caller_auth | caller authorization | check |  | PWRunnerRequireSignedCaller and PWRunnerAllowedIdentifiers in the host's Info.plist, inherited by a copy |  |  |  | the caller's Team ID equals the host's; an optional identifier allowlist |  |  | [`authorizedCaller`](../runner/Sources/PWRunnerCore/PWRunnerService.swift); [`PWRunnerRequireSignedCaller`](../runner/Sources/PWRunnerCore/PWRunnerService.swift); [`PWRunnerAllowedIdentifiers`](../runner/Sources/PWRunnerCore/PWRunnerService.swift) | [`runner_auth_external`](../tests/suites/runner_byoxpc/opt_in/runner_auth_external.sh) |  |
+| selector | request runner selector | record |  | the runner by id or service, with mode and required_entitlements |  |  |  | every required key present with the value true in the worker's recorded read-back; the host's entitlements are recorded, not consulted; a record without a worker read-back is refused with a reinstall message when anything is required |  | before XPC delivery | [`parse_runner_selector_value`](../controller/src/runner_select.rs); [`enforce_required_entitlements`](../controller/src/runner_select.rs); [`strip_runner_selector`](../controller/src/runner_select.rs) | [`malformed_selection_never_falls_back_or_discards_entitlements`](../controller/src/runner_select.rs); [`selection_refuses_a_false_valued_required_key`](../controller/src/runner_select.rs); [`entitlement_gate_consults_the_worker_not_the_host`](../controller/src/runner_select.rs) |  |
+| provenance | runner provenance and binary baselines | record |  | runner kind, service name, registry id and separate host/worker/validator/issuer signature and entitlement read-backs; selected binary hashes observed before invocation; missing older issuer observations remain unknown |  |  |  |  |  |  | [`runner_provenance_from_target`](../controller/src/runner_select.rs); [`observe`](../controller/src/dossier.rs) | [`byoxpc_run_with_a_manifest_compares_the_bundle_copies_with_its_baselines`](../controller/src/run_flow.rs); [`byoxpc_binaries`](../tests/suites/witness_contract/check_dossier.py); [`dossier_witness_byoxpc`](../tests/suites/witness_contract/opt_in/dossier_witness_byoxpc.sh); [`extensions_byoxpc`](../tests/suites/witness_contract/opt_in/extensions_byoxpc.sh) |  |
+| worker | pw-probe-runner in the copy | sandboxed |  |  |  | the installed plist's entitlements; a require-entitlement rule consults this process | the installed identity and the supplied entitlements, signed before the bundle seal |  |  |  | [`sign_install_tree`](../controller/src/runner_manager.rs); [`defaultWorkerExecutablePath`](../runner/Sources/PWRunnerCore/CWorkerOrchestrator.swift) | [`single_use`](../tests/suites/runner_byoxpc/opt_in/single_use.sh); [`entitlement_transfer`](../tests/suites/runner_byoxpc/opt_in/entitlement_transfer.sh) |  |
+| validator | sb_api_validator in the copy | executable |  |  |  |  | the installed identity alone, no entitlements |  |  |  | [`sign_install_tree`](../controller/src/runner_manager.rs); [`defaultValidatorExecutablePath`](../runner/Sources/PWRunnerCore/CWorkerOrchestrator.swift) | [`runner_install`](../tests/suites/runner_byoxpc/run.sh); [`entitlement_readback`](../tests/suites/runner_byoxpc/opt_in/entitlement_readback.sh) |  |
+| verify | runner verify | command |  |  |  | sends a fixed allow-all request through the client and waits 5,000 milliseconds by default |  |  |  | the host it reaches: an immediately following request meets that host's terminal claim (already_ran) or waits for the generated plist's 1 second ThrottleInterval; a refusal executed nothing and the request can be sent again | [`cmd_runner_verify`](../controller/src/runner_commands.rs); [`verify_request`](../controller/src/runner_commands.rs); [`PWRunnerAdmission`](../runner/Sources/PWRunnerCore/PWRunnerService.swift) | [`verification_request_is_the_fixed_allow_all_specimen`](../controller/src/runner_commands.rs) | [`byoxpc_throttle_interval`](LIMITS.md#execution-budgets); [`runner_verify_wait`](LIMITS.md#execution-budgets) |
+| validate | runner validate | command |  |  |  | verifies each record's bundle recursively and the host, worker and validator individually; also verifies the issuer when its file exists or prior issuer evidence is recorded; re-reads those signatures and entitlement sets, reports failures by record and binary, and leaves an absent unrecorded issuer unknown; consults no launchctl |  |  |  |  | [`cmd_runner_validate`](../controller/src/runner_commands.rs); [`codesign_metadata`](../controller/src/runner_manager.rs); [`validate_record`](../controller/src/runner_manager.rs) | [`validation_reports_the_bundle_and_each_binary_that_fails`](../controller/src/runner_manager.rs); [`byoxpc_verification_controls`](../tests/suites/preflight/run.sh); [`runner_install`](../tests/suites/runner_byoxpc/run.sh) |  |
+| remove | runner remove | command |  |  |  | moves ownership to pending_cleanup, boots the service out, removes the plist, retires the record after verified absence |  |  |  |  | [`cmd_runner_remove`](../controller/src/runner_commands.rs); [`bootout_service`](../controller/src/runner_manager.rs); [`cleanup_complete`](../controller/src/runner_manager.rs) | [`registry_recovery`](../tests/suites/runner_byoxpc/opt_in/registry_recovery.sh); [`cleanup`](../tests/fixtures/byoxpc/session.py) |  |
+| reconcile | runner reconcile | command |  |  |  | reports launchd services and plists that look owned, changing nothing |  |  |  |  | [`cmd_runner_reconcile`](../controller/src/runner_commands.rs); [`inspect_service`](../controller/src/runner_manager.rs); [`inspect_plist`](../controller/src/runner_manager.rs) | [`runner_install`](../tests/suites/runner_byoxpc/run.sh) |  |
+| issuer | pw-extension-issuer in the copy | executable |  |  |  | bundle-local ordinary-authority issuance before the worker | installed identity alone, no supplied worker entitlements |  |  |  | [`sign_install_tree`](../controller/src/runner_manager.rs); [`defaultIssuerExecutablePath`](../runner/Sources/PWRunnerCore/CWorkerOrchestrator.swift) | [`extensions_byoxpc`](../tests/suites/witness_contract/opt_in/extensions_byoxpc.sh); [`byoxpc_verification_controls`](../tests/suites/preflight/run.sh) |  |
+
+#### The BYOXPC apparatus edges
+
+| Id | From | To | Kind | Edge | Sources | Checks | Limits |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| X1 | user | bundle_copy | copies | copies the shipped PWRunner.xpc | [`Install a BYOXPC runner`](../docs/PolicyWitness.md) | [`owned_bundle`](../tests/fixtures/byoxpc/session.py); [`runner_install`](../tests/suites/runner_byoxpc/run.sh) |  |
+| X2 | user | install | channel | runner install with --bundle, --identity, --entitlements, --scope and optional --env | [`cmd_runner_install`](../controller/src/runner_commands.rs) | [`install`](../tests/fixtures/byoxpc/session.py); [`runner_install`](../tests/suites/runner_byoxpc/run.sh) |  |
+| X3 | entitlements_plist | signing | reads | supplied entitlements | [`--entitlements`](../controller/src/runner_commands.rs) | [`entitlements`](../tests/fixtures/byoxpc/session.py); [`runner_install`](../tests/suites/runner_byoxpc/run.sh) |  |
+| X4 | install | signing | spawn | sign_install_tree: codesign the worker with --entitlements, the validator, the issuer, then the bundle; codesign --verify --deep --strict | [`sign_install_tree`](../controller/src/runner_manager.rs); [`codesign_verify`](../controller/src/runner_manager.rs) | [`entitlements`](../tests/fixtures/byoxpc/session.py); [`runner_install`](../tests/suites/runner_byoxpc/run.sh) |  |
+| X5 | signing | host | writes | the host executable carries the identity and entitlements; read back by entitlements_from_codesign and codesign_metadata | [`entitlements_from_codesign`](../controller/src/runner_manager.rs) | [`entitlements`](../tests/fixtures/byoxpc/session.py); [`runner_install`](../tests/suites/runner_byoxpc/run.sh) |  |
+| X6 | signing | worker | writes | the worker carries the identity and the supplied entitlements; read back by read_back | [`sign_install_tree`](../controller/src/runner_manager.rs); [`read_back`](../controller/src/runner_manager.rs) | [`entitlement_readback`](../tests/suites/runner_byoxpc/opt_in/entitlement_readback.sh) |  |
+| X7 | signing | validator | writes | the validator carries the identity alone; read back by read_back | [`sign_install_tree`](../controller/src/runner_manager.rs); [`read_back`](../controller/src/runner_manager.rs) | [`entitlement_readback`](../tests/suites/runner_byoxpc/opt_in/entitlement_readback.sh) |  |
+| X8 | install | plist | writes | build_launchd_plist and write_launchd_plist | [`build_launchd_plist`](../controller/src/runner_manager.rs); [`write_launchd_plist`](../controller/src/runner_manager.rs) | [`byoxpc_setup`](../tests/suites/shell_helpers/run.sh) |  |
+| X9 | plist | launchd | launch | launchctl bootstrap into the gui or system domain | [`launchctl_bootstrap`](../controller/src/runner_manager.rs); [`launchctl_target`](../controller/src/runner_manager.rs) | [`service_present`](../tests/fixtures/byoxpc/session.py); [`runner_install`](../tests/suites/runner_byoxpc/run.sh) |  |
+| X10 | launchd | host | launch | start on demand for the Mach service; one launch per ThrottleInterval (1 second) between launches | [`MachServices`](../controller/src/runner_manager.rs); [`NSXPCListener(machServiceName:`](../runner/Services/PWRunner/main.swift) | [`pwrunner_survives_mach_service_launch`](../tests/suites/runner_mach_service_liveness/run.sh) | [`byoxpc_throttle_interval`](LIMITS.md#execution-budgets) |
+| X11 | install | registry | writes | install_record: pending before the plist, installed after the bootstrap | [`install_record`](../controller/src/runner_manager.rs) | [`registry_recovery`](../tests/suites/runner_byoxpc/opt_in/registry_recovery.sh) |  |
+| X12 | user | selector | channel | the specimen's runner field: mode, id or service, required_entitlements | [`parse_runner_selector_value`](../controller/src/runner_select.rs) | [`parses_runner_selector_from_nested_runner`](../controller/src/runner_select.rs) |  |
+| X13 | selector | registry | reads | resolve by id or service; every required entitlement must be granted (value true) in the worker's recorded read-back | [`resolve_runner_target_with_registry`](../controller/src/runner_select.rs); [`enforce_required_entitlements`](../controller/src/runner_select.rs) | [`malformed_selection_never_falls_back_or_discards_entitlements`](../controller/src/runner_select.rs); [`selection_refuses_a_false_valued_required_key`](../controller/src/runner_select.rs) |  |
+| X14 | registry | provenance | reads | runner_provenance_from_target copies kind, service, id and each binary's signature and entitlements | [`runner_provenance_from_target`](../controller/src/runner_select.rs) | [`byoxpc_binaries`](../tests/suites/witness_contract/check_dossier.py); [`extensions_byoxpc`](../tests/suites/witness_contract/opt_in/extensions_byoxpc.sh) |  |
+| X15 | bundle_copy | provenance | reads | Binaries::observe hashes the service, worker, validator and issuer files before invocation | [`observe`](../controller/src/dossier.rs) | [`byoxpc_run_with_a_manifest_compares_the_bundle_copies_with_its_baselines`](../controller/src/run_flow.rs) |  |
+| X16 | client | caller_auth | channel | NSXPCConnection(machServiceName:), privileged for system scope | [`--mach-service`](../runner/Clients/PWRunnerClient/main.swift) | [`runner_install`](../tests/suites/runner_byoxpc/run.sh) |  |
+| X17 | caller_auth | host | guard | shouldAcceptNewConnection: the caller's Team ID equals the host's, and the identifier allowlist if present | [`shouldAcceptNewConnection`](../runner/Sources/PWRunnerCore/PWRunnerService.swift); [`authorizedCaller`](../runner/Sources/PWRunnerCore/PWRunnerService.swift) | [`runner_auth_external`](../tests/suites/runner_byoxpc/opt_in/runner_auth_external.sh) |  |
+| X18 | host | worker | spawn | posix_spawn of the copy's own worker | [`defaultWorkerExecutablePath`](../runner/Sources/PWRunnerCore/CWorkerOrchestrator.swift) | [`single_use`](../tests/suites/runner_byoxpc/opt_in/single_use.sh) |  |
+| X19 | host | validator | spawn | eligible collection spawns the copy’s bundle-local validator by default; an explicit override takes precedence | [`defaultValidatorExecutablePath`](../runner/Sources/PWRunnerCore/CWorkerOrchestrator.swift); [`runSpecimen`](../runner/Sources/PWRunnerCore/PWRunnerService.swift) | [`runner_install`](../tests/suites/runner_byoxpc/run.sh); [`runValidatorSelectionTests`](../runner/Tests/PWRunnerCoreTests/ServiceAdmissionTests.swift) |  |
+| X20 | verify | client | channel | a fixed allow-all request on the client's stdin | [`verify_request`](../controller/src/runner_commands.rs) | [`verification_request_is_the_fixed_allow_all_specimen`](../controller/src/runner_commands.rs) |  |
+| X21 | validate | registry | checks | verifies the bundle recursively and each binary on its own, re-reads every signature and entitlement set, reports failures | [`cmd_runner_validate`](../controller/src/runner_commands.rs); [`validate_record`](../controller/src/runner_manager.rs) | [`byoxpc_verification_controls`](../tests/suites/preflight/run.sh) |  |
+| X22 | remove | launchd | launch | bootout, then re-read for up to 1,000 milliseconds of teardown | [`bootout_service`](../controller/src/runner_manager.rs) | [`cleanup`](../tests/fixtures/byoxpc/session.py); [`runner_install`](../tests/suites/runner_byoxpc/run.sh) | [`runner_remove_teardown_wait`](LIMITS.md#execution-budgets) |
+| X23 | remove | registry | writes | pending_cleanup first; retired only after verified absence of service and plist | [`PendingCleanup`](../controller/src/runner_manager.rs); [`cleanup_complete`](../controller/src/runner_manager.rs) | [`registry_recovery`](../tests/suites/runner_byoxpc/opt_in/registry_recovery.sh) |  |
+| X24 | reconcile | launchd | checks | inspect_service lists candidate services without changes | [`inspect_service`](../controller/src/runner_manager.rs) | [`runner_install`](../tests/suites/runner_byoxpc/run.sh) |  |
+| X25 | reconcile | plist | checks | inspect_plist lists candidate plists without changes | [`inspect_plist`](../controller/src/runner_manager.rs) | [`runner_install`](../tests/suites/runner_byoxpc/run.sh) |  |
+| X26 | signing | issuer | writes | issuer receives identity alone; signature and entitlements read back independently | [`sign_install_tree`](../controller/src/runner_manager.rs); [`read_back`](../controller/src/runner_manager.rs) | [`extensions_byoxpc`](../tests/suites/witness_contract/opt_in/extensions_byoxpc.sh); [`install_signing_signs_helpers_before_the_bundle`](../controller/src/runner_manager.rs) |  |
+| X27 | host | issuer | spawn | copy-local issuer path; named extension capability refusal if missing | [`defaultIssuerExecutablePath`](../runner/Sources/PWRunnerCore/CWorkerOrchestrator.swift); [`capabilityUnavailable`](../runner/Sources/PWRunnerCore/ExtensionIssuer.swift) | [`extensions_byoxpc`](../tests/suites/witness_contract/opt_in/extensions_byoxpc.sh) |  |
+| X28 | issuer | provenance | reads | actual selected path and hash compared with shipped issuer baseline; separate installed read-backs | [`issuer`](../controller/src/dossier.rs); [`runner_issuer_signature`](../controller/src/runner_select.rs) | [`extensions_byoxpc`](../tests/suites/witness_contract/opt_in/extensions_byoxpc.sh) |  |
+
+Every node and edge above cites at least one test or rule.
+
+</details>
+<!-- END GENERATED ARCHITECTURE GRAPH byoxpc -->
+
+## Known gaps
+
+Each gap is stated in full where the promise it limits is stated; this list
+only points there, in document order.
+
+- [Why these processes exist](#why-these-processes-exist):
+  a connection that races the host's retirement can fail before it is
+  refused.

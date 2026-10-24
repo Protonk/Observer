@@ -1,0 +1,957 @@
+"""Read one JSON document: a controller envelope or a bare runner reply.
+
+The document's versions are checked before anything else is interpreted. A
+supported document is validated against the current contract: first its shape
+against the goldens under tests/fixtures/contract/ (the readers' allowlists:
+an unknown key at a recorded path is an error naming the path, a present key
+must carry the golden's type, absence is allowed), then the record rules below.
+Rejected policy-check payloads remain opaque inside their validated capture
+wrappers; admitted helper envelopes are checked against the current shape.
+Evidence is then selected by field. No policy, specimen, errno rule, file or
+production implementation is an input, and nothing here asserts agreement or
+disagreement between the prediction and the attempt. Scenario expectations
+belong to callers.
+
+Public functions:
+
+    validate(document)  -> [error, ...]   one version error, or the shape errors
+    steps(document)     -> [step, ...]    the reply's steps after the version gate
+    select(steps, ...)  -> [step, ...]    steps whose fields equal the given values
+    lifecycle(document) -> view           the registered lifecycle account
+    denials(document)   -> dict           the optional log channel, resolved in place
+"""
+from copy import deepcopy
+import json
+from pathlib import Path
+
+import contract
+import lifecycle_contract
+from lifecycle_adapter import read_lifecycle, summaries
+from document_versions import is_envelope, version_errors, require_supported as _gate
+from extension_evidence import validate_extensions, validate_fresh_read
+from phase_evidence import collection_problem, ownership_problem
+
+
+# The comparison record vocabulary (docs/PolicyWitness.md, "Reading a comparison record").
+OBSERVATIONS = ('succeeded', 'permission_failure', 'other_failure', 'unavailable')
+OBSERVATION_BASES = ('completed_worker_status', 'permission_errno', 'bootstrap_permission_result',
+                     'spawned_child', 'no_completed_worker_result')
+OPERATION_RELATIONS = ('matched', 'different', 'unresolved')
+TARGET_RELATIONS = ('same_submitted', 'different_submitted', 'unresolved')
+ORDERS = ('query_first', 'unestablished')
+QUERY_PLAN_CODES = ('path_unresolved_at_planning', 'prediction_unavailable_pair', 'unrecognized_filter_kind')
+LIFECYCLE_LIMITATIONS = ('attempt:lifecycle_unresolved', 'attempt:lifecycle_conflicting', 'attempt:unsupported',
+                         'attempt:not_reached', 'attempt:started_without_result')
+LIMITATIONS = frozenset(['query_plan:' + code for code in QUERY_PLAN_CODES] + list(LIFECYCLE_LIMITATIONS))
+COMPARISON_KEYS = ('observation', 'observation_basis', 'operation_relation', 'target_relation', 'order', 'limitations')
+# The worker's fixed source buffer less its terminating NUL (PW_SHM_POLICY_BYTES - 1):
+# the bound on both members of the worker's EOF receipt, `worker_evidence.policy_read`.
+POLICY_SOURCE_BYTES = 262143
+
+# The shape goldens: per object path, every key the producers emit and its JSON
+# type. `envelope_shape.json` is rooted at `envelope` and treats the runner
+# reply as opaque; `response_shape.json` is rooted at `reply`. A key absent
+# from the golden at its path belongs to no current document. A policy-check
+# payload refused by helper admission is retained evidence, outside that shape.
+_CONTRACT_DIR = Path(__file__).resolve().parents[1] / 'fixtures' / 'contract'
+ENVELOPE_SHAPE = json.loads((_CONTRACT_DIR / 'envelope_shape.json').read_text())['shape']
+REPLY_SHAPE = json.loads((_CONTRACT_DIR / 'response_shape.json').read_text())['shape']
+# Paths whose contents another golden records, with that golden and its root.
+_REROOTED = {'envelope.data.runner_result': (REPLY_SHAPE, 'reply'),
+             'envelope.data.runner_acquisition[].runner_result': (REPLY_SHAPE, 'reply')}
+SPECIMEN_KEYS = ('request_path', 'policy', 'host', 'runner_provenance', 'app_provenance', 'binaries')
+AUGMENTATION_STATUSES = ('not_requested', 'applied', 'failed', 'not_applicable')
+IMPORT_STATUSES = ('complete', 'incomplete', 'failed', 'not_applicable')
+
+# Attempt-to-query mapping: the operation and filter kind a completed attempt corresponds to.
+ATTEMPT_OPERATIONS = {
+    ('file', 'open_read'): ('file-read-data', 'path'), ('file', 'access'): ('file-read-data', 'path'),
+    ('file', 'read_fresh'): ('file-read-data', 'path'),
+    ('file', 'open_write'): ('file-write-data', 'path'), ('file', 'unlink'): ('file-write-unlink', 'path'),
+    ('mach_lookup', 'bootstrap_look_up'): ('mach-lookup', 'global_name'),
+    ('sysctl', 'read'): ('sysctl-read', 'sysctl_name'), ('exec', 'spawn'): ('process-exec*', 'path'),
+    ('file', 'create'): (None, 'path'),
+}
+PERMISSION_ERRNOS = (1, 13)
+PERMISSION_OUTCOMES = ('open_failed', 'read_failed', 'unlink_failed', 'access_failed', 'sysctl_failed', 'exec_failed')
+
+PATH_FORMS = ('realpath_resolved', 'firmlink_resolved')
+ATTEMPT_PATH_FORMS = ('realpath_resolved', 'parent_realpath_resolved')
+
+
+# ---------------------------------------------------------------------------
+# Version gate
+# ---------------------------------------------------------------------------
+
+def _reply(document):
+    """The runner reply of a supported document, or None when the envelope has no reply."""
+    if is_envelope(document):
+        data = document.get('data') or {}
+        return data.get('runner_result')
+    return document
+
+
+# ---------------------------------------------------------------------------
+# Path forms
+# ---------------------------------------------------------------------------
+
+def validate_path_diagnostics(path, *, forms=PATH_FORMS):
+    """Validate the compact three-state representation without inferring resolution."""
+    if not isinstance(path, dict) or not isinstance(path.get('input'), str):
+        return ['path diagnostics require a string input']
+    if 'same_as_input' not in path:
+        return ['path diagnostics require same_as_input']
+    same = path.get('same_as_input')
+    if not isinstance(same, list) or any(not isinstance(x, str) for x in same) or \
+            len(set(same)) != len(same) or any(x not in forms for x in same):
+        return ['same_as_input must contain unique supported form names']
+    errors = []
+    for name in forms:
+        if (name in same) == (name in path):
+            errors.append(f'{name} must be either listed in same_as_input or present, exclusively')
+        if name in path and path[name] is not None:
+            if not isinstance(path[name], str):
+                errors.append(f'{name} must be a string or null')
+            elif path[name] == path['input']:
+                errors.append(f'{name} with identical UTF-8 bytes must be listed in same_as_input')
+    return errors
+
+
+def path_form(path, name, forms=PATH_FORMS):
+    """'same_as_input', 'resolved', 'unavailable' or 'invalid' for one host path form."""
+    if validate_path_diagnostics(path, forms=forms):
+        return 'invalid'
+    if name in path.get('same_as_input', []):
+        return 'same_as_input'
+    return 'unavailable' if path.get(name) is None else 'resolved'
+
+
+# ---------------------------------------------------------------------------
+# Step-level derivations from raw fields (classification tables, not verdicts)
+# ---------------------------------------------------------------------------
+
+def query_column(step):
+    """The query channel's answer: allow or deny from a validator record, else unavailable."""
+    query = step.get('sandbox_check') if isinstance(step, dict) else None
+    if isinstance(query, dict) and query.get('result_source') == 'validator' and query.get('outcome') in ('allow', 'deny'):
+        return query['outcome']
+    return 'unavailable'
+
+
+def expected_observation(attempt):
+    """(observation, basis) the attempt channel's raw fields support."""
+    if not isinstance(attempt, dict) or attempt.get('result_source') != 'worker':
+        return ('unavailable', 'no_completed_worker_result')
+    rc, outcome, errno = attempt.get('rc'), attempt.get('outcome'), attempt.get('errno')
+    if attempt.get('requested_kind') == 'exec' and type(attempt.get('child_pid')) is int and attempt['child_pid'] > 0:
+        return ('succeeded', 'spawned_child')
+    if outcome == 'ok' and rc == 0:
+        return ('succeeded', 'completed_worker_status')
+    if type(rc) is int and rc != 0:
+        if outcome in PERMISSION_OUTCOMES and errno in PERMISSION_ERRNOS:
+            return ('permission_failure', 'permission_errno')
+        if outcome == 'lookup_failed' and attempt.get('error') == 'bootstrap_look_up: kr=1100':
+            return ('permission_failure', 'bootstrap_permission_result')
+        return ('other_failure', 'completed_worker_status')
+    return ('unavailable', 'no_completed_worker_result')
+
+
+def expected_relations(query, attempt):
+    """(operation_relation, target_relation) from the submitted operations and targets."""
+    mapping = ATTEMPT_OPERATIONS.get((attempt.get('requested_kind'), attempt.get('requested_action')))
+    operation, filter_kind = mapping if mapping else (None, None)
+    query_operation = query.get('operation') if isinstance(query.get('operation'), str) else ''
+    broad = '*' in query_operation and not (operation == 'process-exec*' and query_operation == operation)
+    if operation is None or broad:
+        operation_relation = 'unresolved'
+    else:
+        operation_relation = 'matched' if operation == query_operation else 'different'
+    if filter_kind is None or query.get('filter_kind') != filter_kind or \
+            query.get('filter_value') is None or attempt.get('requested_path') is None:
+        target_relation = 'unresolved'
+    else:
+        target_relation = 'same_submitted' if query['filter_value'] == attempt['requested_path'] else 'different_submitted'
+    return operation_relation, target_relation
+
+
+def _step_phase(runner, step):
+    phases = runner.get('phases')
+    if not isinstance(phases, list):
+        return {}
+    matches = [p for p in phases if isinstance(p, dict) and p.get('phase_id') == step.get('phase_id')
+               and isinstance(p.get('action_ids'), list) and step.get('step_id') in p['action_ids']]
+    return matches[0] if len(matches) == 1 else {}
+
+
+def _ordering_chain(runner, phase):
+    ordering = phase.get('ordering')
+    if not isinstance(ordering, dict):
+        return False
+    return all(ordering.get(k) is True for k in ('collection_closed_before_proceed', 'proceed_set', 'proceed_observed',
+                                                   'worker_lifetime_established')) \
+        and ordering.get('protocol_violations') == [] and runner.get('sandboxed_after_apply') is True \
+        and phase.get('arrival_observed') is True
+
+
+def eligible_order(runner, step):
+    """True when the step's native record and the run's chain support query_first."""
+    query = step.get('sandbox_check')
+    if not isinstance(query, dict):
+        return False
+    worker = runner.get('runner_subprocess') or {}
+    phase = _step_phase(runner, step)
+    validator = phase.get('validator_subprocess')
+    if not isinstance(validator, dict):
+        return False
+    rc, err = query.get('native_rc'), query.get('errno')
+    native = type(rc) is int and type(err) is int and query.get('rc') == rc and (
+        (query.get('outcome') == 'allow' and rc == 0) or (query.get('outcome') == 'deny' and rc == 1 and err == 0))
+    records = validator.get('records')
+    if not isinstance(records, list):
+        return False
+    matches = [r for r in records if isinstance(r, dict) and r.get('step_id') == step.get('step_id')]
+    associated = len(matches) == 1 and all(matches[0].get(k) == v for k, v in {
+        'operation': query.get('operation'), 'filter_type': str(query.get('filter_kind')).upper(),
+        'filter_value': None if query.get('filter_kind') == 'none' else query.get('filter_value'),
+        'outcome': query.get('outcome'), 'rc': rc, 'errno': err}.items())
+    return _ordering_chain(runner, phase) and query.get('result_source') == 'validator' and native and associated \
+        and isinstance(worker, dict) and query.get('pid') == worker.get('pid')
+
+
+# ---------------------------------------------------------------------------
+# Shape: the goldens are allowlists
+# ---------------------------------------------------------------------------
+
+def _json_type(value):
+    if value is None:
+        return 'null'
+    if isinstance(value, bool):
+        return 'boolean'
+    if isinstance(value, (int, float)):
+        return 'number'
+    if isinstance(value, str):
+        return 'string'
+    if isinstance(value, list):
+        return 'array'
+    return 'object'
+
+
+def _validate_policy_check_reply(capture, path, shape, errors):
+    """Admit only the current helper frame; keep rejected JSON opaque."""
+    reply, status = capture['envelope'], capture.get('status')
+    outcome = None
+    if isinstance(reply, dict) and reply.get('kind') == 'sbpl_check' and \
+            type(reply.get('schema_version')) is int and \
+            reply['schema_version'] == contract.CONTROLLER_ENVELOPE:
+        result = reply.get('result')
+        candidate = result.get('normalized_outcome') if isinstance(result, dict) else None
+        if isinstance(candidate, str) and candidate:
+            outcome = candidate
+    if outcome is None:
+        if status != 'invalid_reply' and not (reply is None and status in
+                ('unavailable', 'capture_error', 'parse_error', 'tool_error')):
+            errors.append('data.policy_check.status requires an admitted helper envelope')
+        return
+    if status != outcome:
+        errors.append('data.policy_check.status differs from the admitted helper outcome')
+    validate_shape(reply, path, shape, errors)
+
+
+def _observer_admitted(reply):
+    data = reply.get('data') if isinstance(reply, dict) else None
+    return isinstance(reply, dict) and reply.get('kind') == 'sandbox_log_observer_report' and \
+        type(reply.get('schema_version')) is int and reply['schema_version'] == contract.CONTROLLER_ENVELOPE and \
+        isinstance(data, dict) and type(data.get('observer_schema_version')) is int and data['observer_schema_version'] == 2
+
+
+def _validate_observer_reply(capture, path, shape, errors):
+    reply = capture['observer']
+    if reply is None:
+        return
+    admitted = _observer_admitted(reply)
+    if not admitted:
+        if capture.get('capture_status') not in ('invalid_reply', 'timeout', 'overflow', 'error'):
+            errors.append('sandbox_log_capture status requires an admitted observer')
+        if any(capture.get(key) is not None for key in ('observed_deny', 'deny_events', 'blocked_reason', 'step_denies')):
+            errors.append('inadmissible observer cannot supply log claims')
+        return
+    validate_shape(reply, path, shape, errors)
+
+
+def validate_shape(value, path, shape, errors):
+    """Check one object and everything under it against the golden for its path.
+
+    An unknown key is an error naming the path. A present, non-null key must
+    carry the golden's type; a golden type of `null` constrains nothing. Absent
+    keys are allowed: the goldens are allowlists, not required sets. Objects at
+    a path another golden records (`_REROOTED`) continue under that golden.
+    Policy-check admission precedes shape checks on its retained payload.
+    """
+    allowed = shape.get(path)
+    if allowed is None or not isinstance(value, dict):
+        return
+    for key, child in value.items():
+        if key not in allowed:
+            errors.append(f'unknown key {path}.{key}')
+            continue
+        child_path = f'{path}.{key}'
+        if child_path == 'envelope.data.policy_check.envelope':
+            _validate_policy_check_reply(value, child_path, shape, errors)
+            continue
+        if child_path == 'envelope.data.sandbox_log_capture.observer':
+            _validate_observer_reply(value, child_path, shape, errors)
+            continue
+        actual = _json_type(child)
+        if child is not None and allowed[key] != 'null' and actual != allowed[key]:
+            errors.append(f'{child_path} is {actual}, not {allowed[key]}')
+            continue
+        rerooted = _REROOTED.get(child_path)
+        if rerooted is not None:
+            validate_shape(child, rerooted[1], rerooted[0], errors)
+        elif isinstance(child, dict):
+            validate_shape(child, child_path, shape, errors)
+        elif isinstance(child, list):
+            for item in child:
+                validate_shape(item, child_path + '[]', shape, errors)
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+def validate_exec_observation(attempt):
+    """Validate optional worker observations without inventing facts from absence."""
+    value = attempt.get('exec_observation')
+    if value is None:
+        return []
+    def fail(reason):
+        return ['exec observation: ' + reason]
+    def integer(value, minimum=-(2**31), maximum=2**31-1):
+        return type(value) is int and minimum <= value <= maximum
+    def optional_positive(value):
+        return value is None or integer(value, 1)
+    pid = attempt.get('child_pid')
+    if not (isinstance(value, dict) and integer(pid, 1)
+            and attempt.get('requested_kind') == 'exec' and attempt.get('requested_action') == 'spawn'
+            and attempt.get('result_source') == 'worker'
+            and isinstance(attempt.get('lifecycle'), dict) and attempt['lifecycle'].get('summary') == 'completed'):
+        return fail('requires a published worker exec with positive child PID')
+    c, k, r = (value.get(name) for name in ('collection', 'cleanup', 'reap'))
+    if not all(isinstance(v, dict) for v in (c, k, r)):
+        return fail('required sections are not objects')
+    out, err, wait = c.get('stdout'), c.get('stderr'), r.get('last_wait')
+    if not all(isinstance(v, dict) for v in (out, err, wait)) or type(c.get('leader_exit_observed')) is not bool:
+        return fail('missing collection streams, leader observation or last wait')
+    for stream in (out, err):
+        read, events = stream.get('read_errno'), stream.get('poll_revents')
+        if not (type(stream.get('eof')) is bool and optional_positive(read) and read not in (4, 35)
+                and (events is None or integer(events, -32768, 32767) and events & 0x28 and not events & 0x11)
+                and not (stream['eof'] and (read is not None or events is not None))
+                and not (read is not None and events is not None)):
+            return fail('invalid stream observation')
+    wi, po = c.get('waitid_errno'), c.get('poll_errno')
+    if not (optional_positive(wi) and optional_positive(po) and wi != 4 and po != 4):
+        return fail('invalid terminal collection errno')
+    for fault in (c.get('clock_fault'), r.get('clock_fault')):
+        if fault is not None and not integer(fault, 1, 2**32-1):
+            return fail('invalid local clock reason')
+    stream_error = any(s.get(n) is not None for s in (out, err) for n in ('read_errno', 'poll_revents'))
+    errors = wi is not None or po is not None or stream_error
+    if wi is not None and c['leader_exit_observed']:
+        return fail('waitid failure after already observed leader exit')
+    if wi is not None and (po is not None or stream_error) or po is not None and stream_error:
+        return fail('incompatible collection call branches')
+    stop, fault, deadline = c.get('stop_reason'), c.get('clock_fault'), c.get('deadline_kind')
+    if stop == 'leader_exit_and_eof':
+        valid = c['leader_exit_observed'] and out['eof'] and err['eof'] and not errors and fault is None and deadline is None
+    elif stop == 'deadline':
+        valid = deadline in ('child', 'plan') and not errors and fault is None
+    elif stop == 'observation_error':
+        valid = errors and fault is None and deadline is None
+    elif stop == 'clock_fault':
+        valid = fault is not None and not errors and deadline is None
+    else:
+        valid = False
+    if not valid:
+        return fail('collection stop contradicts observations')
+    def signal_valid(request, target):
+        return (isinstance(request, dict) and integer(request.get('target')) and request['target'] == target
+                and integer(request.get('signal')) and request['signal'] == 9
+                and integer(request.get('rc')) and request['rc'] in (-1, 0)
+                and (integer(request.get('errno'), 1) if request['rc'] == -1 else request.get('errno') is None))
+    state, group, fallback = k.get('state'), k.get('group_request'), k.get('leader_fallback')
+    if state == 'not_requested':
+        valid = stop == 'leader_exit_and_eof' and group is None and fallback is None
+    elif state == 'ownership_unconfirmed':
+        valid = wi is not None and group is None and fallback is None
+    elif state == 'requested':
+        valid = stop != 'leader_exit_and_eof' and wi is None and signal_valid(group, -pid)
+        if valid:
+            expected = group['rc'] == -1 and group.get('errno') != 3
+            valid = expected == (fallback is not None) and (fallback is None or signal_valid(fallback, pid))
+    else:
+        valid = False
+    if not valid:
+        return fail('cleanup request contradicts native call roles')
+    rc, errno, status = wait.get('rc'), wait.get('errno'), wait.get('status')
+    if not (integer(rc) and rc in (-1, 0, pid)
+            and (integer(errno, 1) if rc == -1 else errno is None)
+            and ((rc == pid and integer(status)) or (rc != pid and status is None))):
+        return fail('invalid final wait observation')
+    if status is not None:
+        bits = status & 0x7f
+        exit_code, signal = ((status >> 8) & 0xff if bits == 0 else -1), (bits if bits not in (0, 127) else 0)
+    else:
+        exit_code, signal = -1, 0
+    if (not integer(attempt.get('child_exit_code')) or not integer(attempt.get('child_term_signal'))
+            or attempt['child_exit_code'] != exit_code or attempt['child_term_signal'] != signal):
+        return fail('legacy leader status does not match confirmed wait')
+    failed_group = isinstance(group, dict) and group.get('rc') == -1 and group.get('errno') != 3
+    stop = r.get('stop_reason')
+    if stop == 'reaped':
+        valid = rc == pid
+    elif stop == 'wait_error':
+        valid = rc == -1 and errno != 4
+    elif stop in ('ownership_unconfirmed', 'group_request_failed', 'clock_fault', 'deadline'):
+        valid = rc == 0 or (rc == -1 and errno == 4)
+        if stop == 'ownership_unconfirmed':
+            valid = valid and state == 'ownership_unconfirmed'
+        elif stop == 'group_request_failed':
+            valid = valid and state != 'ownership_unconfirmed' and failed_group
+        else:
+            valid = valid and state != 'ownership_unconfirmed' and not failed_group
+            valid = valid and ((stop == 'clock_fault') == (r.get('clock_fault') is not None))
+    else:
+        valid = False
+    return [] if valid else fail('reap stop contradicts final wait or branch priority')
+
+
+def _validate_step(runner, step, failed_reporting):
+    errors = []
+    sid = step.get('step_id')
+    query = step.get('sandbox_check')
+    attempt = step.get('attempt')
+    if not isinstance(query, dict):
+        errors.append(f'{sid}: missing sandbox_check')
+        query = {}
+    if not isinstance(attempt, dict):
+        errors.append(f'{sid}: missing attempt')
+        attempt = {}
+    for key in ('requested_kind', 'requested_action'):
+        if not isinstance(attempt.get(key), str):
+            errors.append(f'{sid}: missing attempt.{key}')
+    if type(attempt.get('rc')) is not int:
+        errors.append(f'{sid}: invalid attempt.rc')
+    if attempt.get('errno') is not None and type(attempt.get('errno')) is not int:
+        errors.append(f'{sid}: invalid attempt.errno')
+    errors.extend(f'{sid}: {error}' for error in validate_fresh_read(attempt))
+    if not failed_reporting:
+        errors.extend(f'{sid}: {error}' for error in validate_exec_observation(attempt))
+    if not isinstance(query.get('operation'), str) or not isinstance(query.get('filter_kind'), str):
+        errors.append(f'{sid}: missing sandbox_check.operation or filter_kind')
+    if query.get('outcome') == 'prediction_unavailable' and query.get('rc') != -1:
+        errors.append(f'{sid}: unavailable prediction requires rc=-1')
+    path = query.get('path_diagnostics')
+    if path is not None:
+        if not isinstance(path, dict) or (path.get('observer'), path.get('stage')) != ('runner_host', 'after_orchestration'):
+            errors.append(f'{sid}: path diagnostics lack host/stage provenance')
+        errors.extend(f'{sid}: {error}' for error in validate_path_diagnostics(path))
+    attempt_path = attempt.get('path_diagnostics')
+    if attempt_path is not None:
+        if not isinstance(attempt_path, dict) or \
+                (attempt_path.get('observer'), attempt_path.get('stage')) != ('runner_host', 'after_orchestration'):
+            errors.append(f'{sid}: attempt path diagnostics lack host/stage provenance')
+        if isinstance(attempt_path, dict):
+            if attempt_path.get('input') != attempt.get('requested_path') or not isinstance(attempt.get('requested_path'), str):
+                errors.append(f'{sid}: attempt path diagnostics input differs from requested_path')
+            errors.extend(f'{sid}: attempt {error}' for error in validate_path_diagnostics(attempt_path, forms=ATTEMPT_PATH_FORMS))
+    elif attempt.get('requested_kind') in ('file', 'exec') and isinstance(attempt.get('requested_path'), str) and attempt['requested_path']:
+        errors.append(f'{sid}: file/exec attempt without path diagnostics')
+    comparison = step.get('comparison')
+    if failed_reporting:
+        if comparison is not None:
+            errors.append(f'{sid}: reporting failure must withhold every comparison')
+        return errors
+    if not isinstance(comparison, dict):
+        errors.append(f'{sid}: missing comparison')
+        return errors
+    for key, allowed in (('observation', OBSERVATIONS), ('observation_basis', OBSERVATION_BASES),
+                         ('operation_relation', OPERATION_RELATIONS), ('target_relation', TARGET_RELATIONS),
+                         ('order', ORDERS)):
+        if comparison.get(key) not in allowed:
+            errors.append(f'{sid}: invalid comparison.{key}')
+    limits = comparison.get('limitations')
+    if not isinstance(limits, list) or any(not isinstance(x, str) for x in limits):
+        errors.append(f'{sid}: invalid comparison.limitations')
+        limits = []
+    for limit in limits:
+        if limit not in LIMITATIONS:
+            errors.append(f'{sid}: limitation outside the vocabulary: {limit}')
+    if len(set(limits)) != len(limits):
+        errors.append(f'{sid}: repeated limitation')
+    # Classification checks against the raw channel fields.
+    observation, basis = expected_observation(attempt)
+    if (comparison.get('observation'), comparison.get('observation_basis')) != (observation, basis):
+        errors.append(f'{sid}: comparison.observation {comparison.get("observation")}/{comparison.get("observation_basis")} '
+                      f'disagrees with the attempt fields ({observation}/{basis})')
+    operation_relation, target_relation = expected_relations(query, attempt)
+    if comparison.get('operation_relation') != operation_relation:
+        errors.append(f'{sid}: comparison.operation_relation disagrees with the submitted operations ({operation_relation})')
+    if comparison.get('target_relation') != target_relation:
+        errors.append(f'{sid}: comparison.target_relation disagrees with the submitted targets ({target_relation})')
+    eligible = eligible_order(runner, step)
+    if comparison.get('order') == 'query_first' and not eligible:
+        errors.append(f'{sid}: query_first lacks eligible record or ordering chain')
+    if comparison.get('order') == 'unestablished' and eligible:
+        errors.append(f'{sid}: eligible record with complete chain requires query_first')
+    plan_limits = [l for l in limits if l.startswith('query_plan:')]
+    if query.get('outcome') == 'prediction_unavailable':
+        if query.get('result_source') != 'synthetic' or query.get('missing_reason') != 'query_not_requested':
+            errors.append(f'{sid}: planning exclusion requires a synthetic query_not_requested record')
+        if len(plan_limits) != 1:
+            errors.append(f'{sid}: planning exclusion requires exactly one query_plan limitation')
+    elif plan_limits:
+        errors.append(f'{sid}: query_plan limitation without a planning exclusion')
+    summary = (attempt.get('lifecycle') or {}).get('summary') if isinstance(attempt.get('lifecycle'), dict) else None
+    expected_lifecycle = lifecycle_contract.LIMITATION_FOR_SUMMARY.get(summary) if summary else None
+    lifecycle_limits = [l for l in limits if l.startswith('attempt:')]
+    if lifecycle_limits != ([expected_lifecycle] if expected_lifecycle else []):
+        errors.append(f'{sid}: lifecycle limitations {lifecycle_limits} disagree with attempt.lifecycle.summary {summary!r}')
+    return errors
+
+
+def _validate_reply(runner):
+    errors = []
+    capture = runner.get('compiled_profile')
+    if capture is not None:
+        if not isinstance(capture, dict) or type(capture.get('schema_version')) is not int or capture['schema_version'] != 2:
+            errors.append('unsupported or malformed compiled_profile schema_version')
+        elif capture.get('status') == 'captured':
+            if capture.get('producer') != 'worker' or capture.get('capture_stage') != 'before_apply':
+                errors.append('compiled_profile requires worker/before_apply context')
+        elif capture.get('status') == 'unavailable':
+            if capture.get('producer') is not None or capture.get('capture_stage') is not None:
+                errors.append('unavailable compiled_profile cannot claim capture context')
+        else:
+            errors.append('invalid compiled_profile status')
+    failure = runner.get('reporting_failure')
+    failed_reporting = failure is not None
+    if failed_reporting or runner.get('normalized_outcome') == 'runner_reporting_failed':
+        if runner.get('normalized_outcome') != 'runner_reporting_failed' or runner.get('rc') != 1 or \
+                not isinstance(runner.get('error'), str) or not runner['error']:
+            errors.append('reporting failure requires a failed summary and diagnostic')
+        if not isinstance(failure, dict) or failure.get('origin') != 'runner_host' or \
+                not isinstance(failure.get('diagnostic'), str) or not failure['diagnostic'] or \
+                type(failure.get('original_rc')) is not int or \
+                not isinstance(failure.get('original_normalized_outcome'), str) or not failure['original_normalized_outcome'] or \
+                (failure.get('original_error') is not None and not isinstance(failure['original_error'], str)) or \
+                type(failure.get('evidence_retained')) is not bool:
+            errors.append('invalid reporting_failure diagnostics')
+        elif not failure['evidence_retained'] and (runner.get('steps') != [] or
+                runner.get('runner_subprocess') is not None or runner.get('phases') != [] or
+                runner.get('extensions') or runner.get('extension_events')):
+            errors.append('reporting failure without evidence retention must omit steps, subprocesses and validator spawn evidence')
+    steps_value = runner.get('steps')
+    if not isinstance(steps_value, list):
+        errors.append('steps is not a list')
+        steps_value = []
+    for step in steps_value:
+        if not isinstance(step, dict):
+            errors.append('step is not an object')
+            continue
+        errors.extend(_validate_step(runner, step, failed_reporting))
+    if not failed_reporting:
+        errors.extend(_validate_phases(runner))
+        errors.extend(validate_extensions(runner))
+    sub = runner.get('runner_subprocess')
+    if isinstance(sub, dict) and sub.get('policy_transfer_timeout') is not None:
+        timeout = sub['policy_transfer_timeout']
+        if not isinstance(timeout, dict) or any(type(timeout.get(k)) is not int or timeout[k] < 0
+                for k in ('budget_ms','elapsed_ms','bytes_written','bytes_expected')) or \
+                timeout['budget_ms'] <= 0 or timeout['elapsed_ms'] < timeout['budget_ms'] or \
+                timeout['bytes_written'] > timeout['bytes_expected']:
+            errors.append('invalid policy_transfer_timeout observation')
+        if sub.get('policy_transfer_error') is not None or sub.get('poll_stop_reason') != 'policy_transfer_deadline':
+            errors.append('policy_transfer_timeout conflicts with transfer stop/error')
+    evidence = sub.get('worker_evidence') if isinstance(sub, dict) else None
+    read = evidence.get('policy_read') if isinstance(evidence, dict) else None
+    if read is not None:
+        # The worker's EOF receipt. Both counts are required integers within the
+        # source capacity; the host's own expectation on any transfer record agrees
+        # with it; and a length refusal (operation 2, code 13) names the received
+        # count while the counts differ. Unequal counts allow a pre-compile partial
+        # observation, never later worker execution. A reporting-failure reply
+        # retains contradictory values without comparisons; structure still applies.
+        if not isinstance(read, dict) or set(read) != {'bytes_expected', 'bytes_received'} or \
+                any(type(read[k]) is not int for k in read):
+            errors.append('invalid worker_evidence.policy_read receipt')
+        elif not failed_reporting:
+            if any(not 0 <= read[k] <= POLICY_SOURCE_BYTES for k in read):
+                errors.append('invalid worker_evidence.policy_read receipt')
+            for key in ('policy_transfer_timeout', 'policy_transfer_error'):
+                record = sub.get(key)
+                if isinstance(record, dict) and record.get('bytes_expected') != read['bytes_expected']:
+                    errors.append(f'{key} expectation disagrees with worker_evidence.policy_read')
+            failure = evidence.get('failure')
+            if isinstance(failure, dict) and failure.get('operation') == 2 and failure.get('code') == 13 and \
+                    (failure.get('detail') != read['bytes_received'] or read['bytes_received'] == read['bytes_expected']):
+                errors.append('length refusal detail disagrees with worker_evidence.policy_read')
+            if read['bytes_received'] != read['bytes_expected']:
+                after_read = (3, 4, 5, 6, 7, 8, 9, 10, 11)
+                progress = evidence.get('progress')
+                phases = runner.get('phases')
+                if runner.get('sandboxed_after_apply') is True or sub.get('ready_byte_received') is True or \
+                        sub.get('done_observed') is True or evidence.get('readiness') is not None or \
+                        (isinstance(progress, dict) and progress.get('operation') in after_read) or \
+                        (isinstance(failure, dict) and failure.get('operation') in after_read) or \
+                        (isinstance(phases, list) and any(isinstance(p, dict) and
+                         (p.get('arrival_observed') is True or p.get('completion_observed') is True or
+                          (isinstance(p.get('ordering'), dict) and p['ordering'].get('proceed_observed') is True)) for p in phases)) or \
+                        any(isinstance(s, dict) and isinstance(s.get('attempt'), dict) and
+                            s['attempt'].get('result_source') == 'worker' for s in steps_value):
+                    errors.append('unequal worker_evidence.policy_read counts contradict observations after the policy length check')
+    if isinstance(sub, dict) and not failed_reporting and sub.get(lifecycle_contract.RECORD_KEY) is None:
+        errors.append('worker subprocess without runner_subprocess.disposition')
+    return errors
+
+
+def _validate_phases(runner):
+    phases = runner.get('phases')
+    if not isinstance(phases, list) or len(phases) > 8:
+        return ['phases must be a bounded array']
+    errors, ids, actions = [], [], []
+    if runner.get('runner_subprocess') is not None and not phases:
+        errors.append('a worker subprocess requires phase evidence')
+    for index, phase in enumerate(phases):
+        if not isinstance(phase, dict):
+            errors.append('phase is not an object'); continue
+        pid = phase.get('phase_id')
+        if not isinstance(pid, str) or not pid or len(pid.encode('utf-8')) > 63 or '\0' in pid:
+            errors.append('invalid phase_id')
+        ids.append(pid)
+        if type(phase.get('ordinal')) is not int or phase['ordinal'] != index + 1:
+            errors.append('phase ordinal disagrees with sequence')
+        action_ids = phase.get('action_ids')
+        if not isinstance(action_ids, list) or any(not isinstance(x, str) for x in action_ids):
+            errors.append('invalid phase action_ids')
+        else:
+            actions.extend(action_ids)
+        if phase.get('collection_status') not in ('not_reached', 'not_needed', 'collected', 'budget_exhausted', 'clock_unavailable'):
+            errors.append('invalid phase collection_status')
+        problem = collection_problem(phase)
+        if problem:
+            errors.append(problem)
+        problem = ownership_problem(runner, phase)
+        if problem:
+            errors.append(problem)
+        for key in ('arrival_observed', 'completion_observed'):
+            if type(phase.get(key)) is not bool:
+                errors.append('invalid phase ' + key)
+        ordering = phase.get('ordering')
+        if not isinstance(ordering, dict):
+            ordering = {}
+        if phase.get('completion_observed') is True and (phase.get('arrival_observed') is not True or ordering.get('proceed_observed') is not True):
+            errors.append('phase completion lacks arrival or acknowledgement')
+        if phase.get('arrival_observed') is True and index and (not isinstance(phases[index - 1], dict) or phases[index - 1].get('completion_observed') is not True):
+            errors.append('phase arrival lacks preceding completion')
+        if ordering.get('collection_closed_before_proceed') is True and phase.get('arrival_observed') is not True:
+            errors.append('collection closure lacks phase arrival')
+        errors.extend(_validate_ordering(runner, phase))
+    if len({str(x) for x in ids}) != len(ids) or len(set(actions)) != len(actions):
+        errors.append('duplicate phase/action identity')
+    steps = [x for x in runner.get('steps', []) if isinstance(x, dict)]
+    events = runner.get('extension_events', [])
+    events = [x for x in events if isinstance(x, dict)] if isinstance(events, list) else []
+    step_ids = [x.get('step_id') for x in steps]
+    event_ids = [x.get('step_id') for x in events]
+    all_ids = step_ids + event_ids
+    if len(actions) > 256 or any(not isinstance(x, str) for x in all_ids) or \
+            sorted(actions) != sorted(x for x in all_ids if isinstance(x, str)) or \
+            [x for x in actions if x in step_ids] != step_ids or [x for x in actions if x in event_ids] != event_ids or \
+            any(not _step_phase(runner, action) for action in steps + events):
+        errors.append('phase actions do not partition the ordered steps')
+    return errors
+
+
+def _validate_ordering(runner, phase):
+    errors = []
+    worker = runner.get('runner_subprocess')
+    validator = phase.get('validator_subprocess')
+    if validator is not None and not isinstance(validator, dict):
+        errors.append('invalid phase validator subprocess')
+    validator = validator if isinstance(validator, dict) else {}
+    spawn = phase.get('validator_spawn_failure')
+    if spawn is not None:
+        if not isinstance(spawn, dict) or spawn.get('origin') != 'runner_host' or spawn.get('operation') != 'posix_spawn' or \
+                not isinstance(spawn.get('executable_path'), str) or not spawn['executable_path'] or \
+                type(spawn.get('return_code')) is not int or spawn['return_code'] == 0 or \
+                not isinstance(spawn.get('diagnostic'), str):
+            errors.append('invalid validator_spawn_failure record')
+        elif phase.get('validator_subprocess') is not None:
+            errors.append('validator_spawn_failure cannot coexist with a validator subprocess')
+    if not isinstance(worker, dict):
+        return errors
+    ordering = phase.get('ordering')
+    if not isinstance(ordering, dict):
+        return ['phase ordering is required beside a worker subprocess']
+    for key in ('collection_closed_before_proceed', 'proceed_set', 'proceed_observed', 'worker_lifetime_established'):
+        if type(ordering.get(key)) is not bool:
+            errors.append('invalid ordering.' + key)
+    disposition = ordering.get('validator_disposition')
+    if disposition not in ('not_invoked', 'not_needed', 'not_spawned', 'reaped', 'unconfirmed'):
+        errors.append('invalid ordering.validator_disposition')
+    faults = ordering.get('protocol_violations')
+    if not isinstance(faults, list) or any(not isinstance(x, str) for x in faults):
+        errors.append('invalid ordering.protocol_violations')
+        faults = []
+    c, s, o = (ordering.get(k) is True for k in ('collection_closed_before_proceed', 'proceed_set', 'proceed_observed'))
+    contradictions = []
+    if s and not c:
+        contradictions.append('release_without_collection_closure')
+    if o and not s:
+        contradictions.append('acknowledgement_without_release')
+    if (s or o) and runner.get('sandboxed_after_apply') is not True:
+        contradictions.append('release_without_successful_application')
+    failure = ((worker.get('worker_evidence') or {}).get('failure') or {})
+    if failure.get('operation') == 11 and type(phase.get('ordinal')) is int and failure.get('index') == phase['ordinal'] - 1 and (o or any((x.get('attempt') or {}).get('result_source') == 'worker'
+                                                     for x in runner.get('steps', []) if isinstance(x, dict) and x.get('phase_id') == phase.get('phase_id'))):
+        contradictions.append('attempt_or_acknowledgement_after_proceed_failure')
+    for fault in contradictions:
+        if fault not in faults:
+            errors.append('unmarked ordering protocol violation: ' + fault)
+    if c != (disposition != 'not_invoked'):
+        errors.append('ordering collection decision disagrees with validator disposition')
+    if disposition == 'reaped' and validator.get('reaped') is not True:
+        errors.append('ordering reaped disposition lacks validator reap evidence')
+    if disposition == 'unconfirmed' and (not validator or validator.get('reaped') is not False):
+        errors.append('ordering unconfirmed disposition lacks validator evidence')
+    if disposition in ('not_needed', 'not_spawned', 'not_invoked') and validator:
+        errors.append('ordering terminal decision contradicts validator subprocess')
+    return errors
+
+
+def _validate_envelope(document):
+    errors = []
+    data = document.get('data')
+    if not isinstance(data, dict):
+        return ['data is not an object']
+    specimen = data.get('specimen')
+    if not isinstance(specimen, dict):
+        errors.append('missing data.specimen')
+    else:
+        for key in SPECIMEN_KEYS:
+            if key not in specimen:
+                errors.append(f'missing data.specimen.{key}')
+        policy = specimen.get('policy')
+        if not isinstance(policy, dict):
+            errors.append('data.specimen.policy is not an object')
+        else:
+            augmentation = policy.get('augmentation')
+            if not isinstance(augmentation, dict) or augmentation.get('status') not in AUGMENTATION_STATUSES or \
+                    not isinstance(augmentation.get('applied'), list):
+                errors.append('invalid data.specimen.policy.augmentation')
+            imports = policy.get('imports')
+            if not isinstance(imports, dict) or imports.get('status') not in IMPORT_STATUSES or \
+                    not isinstance(imports.get('records'), list):
+                errors.append('invalid data.specimen.policy.imports')
+            elif imports['status'] in ('failed', 'not_applicable') and (imports.get('records') or imports.get('closure_sha256') is not None):
+                errors.append('an unrun imports scan carries no records or closure hash')
+        host = specimen.get('host')
+        if not isinstance(host, dict) or any(k not in host for k in ('macos_version', 'macos_build', 'kernel_release', 'arch')):
+            errors.append('invalid data.specimen.host')
+        binaries = specimen.get('binaries')
+        if not isinstance(binaries, dict) or any(k not in binaries for k in ('service', 'worker', 'validator')):
+            errors.append('invalid data.specimen.binaries')
+        else:
+            for role, record in binaries.items():
+                if record is None:
+                    continue
+                if not isinstance(record, dict) or record.get('verification') not in ('match', 'mismatch', 'unavailable') or \
+                        (record['verification'] == 'match') != (record.get('reason') is None):
+                    errors.append(f'invalid data.specimen.binaries.{role}')
+        app = specimen.get('app_provenance')
+        if app is not None and (not isinstance(app, dict) or set(app) != {'evidence_manifest_path', 'evidence_verify'}):
+            errors.append('data.specimen.app_provenance carries keys other than the manifest path and verify report')
+    client = data.get('runner_client')
+    if client is not None:
+        if not isinstance(client, dict) or 'request_delivery' not in client:
+            errors.append('data.runner_client lacks request_delivery')
+        else:
+            delivery = client['request_delivery']
+            if delivery is not None and (not isinstance(delivery, dict) or type(delivery.get('bytes_written')) is not int
+                                         or (delivery.get('error') is not None and not isinstance(delivery['error'], str))):
+                errors.append('invalid data.runner_client.request_delivery')
+    acquisitions = data.get('runner_acquisition', [])
+    if not isinstance(acquisitions, list):
+        errors.append('data.runner_acquisition is not an array')
+    else:
+        for attempt in acquisitions:
+            if not isinstance(attempt, dict):
+                errors.append('invalid acquisition attempt')
+                continue
+            refusal = attempt.get('runner_result')
+            identity = attempt.get('generation')
+            capture = attempt.get('runner_client')
+            if not all(isinstance(value, dict) for value in (refusal, identity, capture)):
+                errors.append('acquisition requires refusal, generation and client objects')
+                continue
+            if (refusal.get('schema_version') != contract.RESPONSE_SCHEMA or
+                    refusal.get('normalized_outcome') != 'already_ran' or
+                    refusal.get('steps') != [] or refusal.get('runner_subprocess') is not None or
+                    refusal.get('pid') != identity.get('pid')):
+                errors.append('acquisition requires an admitted pre-worker refusal from its generation')
+            if (type(identity.get('pid')) is not int or identity['pid'] <= 0 or
+                    type(identity.get('start_sec')) is not int or type(identity.get('start_usec')) is not int or
+                    not isinstance(identity.get('executable_path'), str)):
+                errors.append('acquisition requires a process generation and executable')
+            delivery = capture.get('request_delivery') or {}
+            if not isinstance(delivery, dict) or delivery.get('error') is not None:
+                errors.append('failed delivery cannot qualify for acquisition')
+            exited, status = attempt.get('observed_exit'), attempt.get('wait_outcome')
+            if status not in ('retired', 'deadline', 'observation_failed') or (status == 'retired') != isinstance(exited, dict):
+                errors.append('acquisition wait outcome disagrees with exit observation')
+            if (status == 'observation_failed') != isinstance(attempt.get('observation_error'), str):
+                errors.append('acquisition observation error disagrees with wait outcome')
+            if isinstance(exited, dict):
+                replacement = exited.get('replacement')
+                if exited.get('basis') == 'esrch':
+                    if replacement is not None:
+                        errors.append('ESRCH cannot name a replacement generation')
+                elif exited.get('basis') == 'pid_reused':
+                    if (not isinstance(replacement, dict) or replacement.get('pid') != identity.get('pid') or
+                            type(replacement.get('start_sec')) is not int or type(replacement.get('start_usec')) is not int or
+                            (replacement.get('start_sec'), replacement.get('start_usec')) == (identity.get('start_sec'), identity.get('start_usec'))):
+                        errors.append('PID reuse requires a different start time')
+                else:
+                    errors.append('unknown acquisition exit basis')
+    diagnostics = data.get('runner_sandbox_diagnostics')
+    if diagnostics is not None and not isinstance(diagnostics, dict):
+        errors.append('data.runner_sandbox_diagnostics is not an object')
+    capture = data.get('sandbox_log_capture')
+    if isinstance(capture, dict) and capture.get('observer') is not None and not _observer_admitted(capture['observer']):
+        if isinstance(diagnostics, dict) and (diagnostics.get('correlation_status') not in (None,'unavailable') or
+                diagnostics.get('permission_failures_without_record') is not None):
+            errors.append('inadmissible observer cannot supply correlation or missing-record claims')
+    return errors
+
+
+def validate(document):
+    """The single version error, or every shape and record error of a supported document."""
+    errors = version_errors(document)
+    if errors:
+        return errors
+    if is_envelope(document):
+        validate_shape(document, 'envelope', ENVELOPE_SHAPE, errors)
+        errors.extend(_validate_envelope(document))
+        runner = _reply(document)
+        if runner is not None:
+            errors.extend(_validate_reply(runner))
+        return errors
+    validate_shape(document, 'reply', REPLY_SHAPE, errors)
+    errors.extend(_validate_reply(document))
+    return errors
+
+
+# ---------------------------------------------------------------------------
+# Accessors
+# ---------------------------------------------------------------------------
+
+def steps(document):
+    """The reply's steps, after the version gate; [] when the envelope has no reply."""
+    _gate(document)
+    runner = _reply(document)
+    if runner is None:
+        return []
+    value = runner.get('steps')
+    return deepcopy(value) if isinstance(value, list) else []
+
+
+def _lookup(step, path):
+    current = step
+    for key in path.split('.'):
+        if not isinstance(current, dict) or key not in current:
+            return ('<absent>',)
+        current = current[key]
+    return current
+
+
+def select(steps_value, **fields):
+    """Steps whose fields equal the given values.
+
+    Keys name comparison fields directly (`observation`, `operation_relation`,
+    `order`, `limitations`, ...), `query` for the query channel's answer
+    (allow, deny or unavailable), `step_id`, or any dotted path spelled with
+    `__` (`attempt__errno=13`, `sandbox_check__outcome='deny'`). A value of
+    `select.ABSENT` matches a missing key; `None` matches an explicit null.
+    """
+    chosen = []
+    for step in steps_value:
+        if not isinstance(step, dict):
+            continue
+        ok = True
+        for key, wanted in fields.items():
+            if key == 'query':
+                got = query_column(step)
+            elif key in COMPARISON_KEYS:
+                got = _lookup(step, 'comparison.' + key)
+            else:
+                got = _lookup(step, key.replace('__', '.'))
+            if got == ('<absent>',):
+                got = ABSENT
+            if got != wanted:
+                ok = False
+                break
+        if ok:
+            chosen.append(step)
+    return chosen
+
+
+class _Absent:
+    def __repr__(self):
+        return '<absent>'
+
+
+ABSENT = _Absent()
+select.ABSENT = ABSENT
+
+
+def lifecycle(document):
+    """The registered lifecycle account of a supported document."""
+    _gate(document)
+    envelope = document if is_envelope(document) else {
+        'schema_version': contract.CONTROLLER_ENVELOPE, 'kind': 'run', 'data': {'runner_result': document}}
+    view = read_lifecycle(envelope)
+    return {'reporting': view['reporting'], 'summaries': summaries(view), 'record': view['record'],
+            'malformed': view['malformed'],
+            'projections': {k: view['projections'].get(k) for k in
+                            ('process_disposition', 'termination_cause', 'stop_reason', 'disposition_integrity')}}
+
+
+def denials(document):
+    """The optional log channel with candidate references resolved in place."""
+    _gate(document)
+    if not is_envelope(document):
+        raise ValueError('denial evidence lives in the controller envelope, not the bare reply')
+    data = document.get('data') or {}
+    capture = data.get('sandbox_log_capture') or {}
+    diagnostics = data.get('runner_sandbox_diagnostics') or {}
+    rejected = capture.get('observer') is not None and not _observer_admitted(capture['observer'])
+    events = None if rejected else capture.get('deny_events')
+    associations = None if rejected else capture.get('step_denies')
+    candidates = None
+    if associations is not None:
+        candidates = []
+        for association in associations:
+            index = association.get('event_index')
+            event = events[index] if isinstance(events, list) and type(index) is int and 0 <= index < len(events) else None
+            candidates.append(dict(association, event=event))
+    return deepcopy({
+        'capture_status': capture.get('capture_status', 'not_reported') if data.get('sandbox_log_capture') is not None else 'not_reported',
+        'correlation_status': 'unavailable' if rejected else diagnostics.get('correlation_status', 'not_reported'),
+        'permission_failures_without_record': None if rejected else diagnostics.get('permission_failures_without_record'),
+        'window': capture.get('window'), 'events': events, 'candidates': candidates,
+        'event_reporting': 'reported' if events is not None else 'not_reported',
+        'association_reporting': 'reported' if associations is not None else 'not_reported',
+        'diagnostics': data.get('runner_sandbox_diagnostics'),
+        'capture': data.get('sandbox_log_capture'),
+    })

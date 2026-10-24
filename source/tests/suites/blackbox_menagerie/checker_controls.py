@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""Drive both checker CLIs with independent evidence and deliberate faults.
+
+These expectations are authored here, never obtained from the checker or the
+observed result. Keep the mutations and required diagnostics outside tests/lib.
+"""
+import copy
+from collections import Counter
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[3]
+BASELINE = ROOT / "tests/fixtures/blackbox_e2e/checker/response23/missing_path_run.json"
+
+
+def main():
+    artifacts = Path(sys.argv[1])
+    artifacts.mkdir(parents=True, exist_ok=True)
+    baseline = json.loads(BASELINE.read_text())
+    submitted = json.loads(BASELINE.with_name("missing_path_specimen.json").read_text())
+    allowed_read = next(step["attempt"] for step in submitted["probe_plan"]
+                        if step["step_id"] == "fs_read_allowed")
+    baseline["data"]["runner_result"]["policy_sha256"] = "a" * 64
+    expectations = {
+        "blackbox_e2e": {
+            "policy_format": "sbpl", "require_sandboxed_after_apply": True,
+            "steps": [
+                {"step_id": "fs_read_missing", "sandbox_outcome": "prediction_unavailable",
+                 "attempt_ok": False, "errno": 2},
+                {"step_id": "mach_lookup_invalid", "sandbox_outcome": "allow",
+                 "attempt_ok": False},
+                {"step_id": "fs_read_allowed", "sandbox_outcome": "allow",
+                 "attempt_ok": True, "errno": None},
+            ],
+        },
+        "blackbox_menagerie": {"steps": [
+            {"step_id": "fs_read_missing",
+             "expect": {"predict": "prediction_unavailable", "attempt_ok": False, "errno": 2,
+                        "comparison": {"observation": "other_failure", "order": "unestablished"}}},
+            {"step_id": "mach_lookup_invalid",
+             "expect": {"predict": "allow", "attempt_ok": False}},
+            {"step_id": "fs_read_allowed",
+             "expect": {"predict": "allow", "attempt_ok": True, "errno": None,
+                        "comparison": {"observation": "succeeded", "operation_relation": "matched",
+                                       "target_relation": "same_submitted"}}},
+        ]},
+    }
+    failures = []
+    count = 0
+
+    def check(name, envelope, diagnostics=(), *, expected=None, suites=None, status=0,
+              same_diagnostics_as=None):
+        nonlocal count
+        observed = {}
+        for suite in suites or expectations:
+            count += 1
+            stem = artifacts / f"{suite}.{name}"
+            run_path = Path(f"{stem}.run.json")
+            expected_path = Path(f"{stem}.expected.json")
+            run_path.write_text(json.dumps(envelope, indent=2) + "\n")
+            expected_path.write_text(json.dumps((expected or expectations)[suite], indent=2) + "\n")
+            checker = ROOT / "tests/suites" / suite / "validate_run.py"
+            result = subprocess.run(
+                [sys.executable, '-B', '-S', str(checker), str(run_path), str(expected_path)],
+                capture_output=True, text=True, timeout=5,
+            )
+            output = result.stdout + result.stderr
+            Path(f"{stem}.log").write_text(f"rc={result.returncode}\n{output}")
+            # Successful checker output is a summary, not a diagnostic.
+            lines = output.splitlines() if result.returncode else []
+            observed[suite] = lines
+            if result.returncode != status or any(note not in output for note in diagnostics):
+                failures.append(f"{suite}/{name}: expected rc={status}, diagnostics={diagnostics!r}; "
+                                f"got rc={result.returncode}, output={output!r}")
+                continue
+            if same_diagnostics_as is not None:
+                order = [line for line in lines if line.startswith("expected step IDs in order ")]
+                remaining = Counter(lines) - Counter(order)
+                reference = Counter(same_diagnostics_as[suite])
+                if len(order) != 1 or remaining != reference:
+                    failures.append(f"{suite}/{name}: reordering changed step diagnostics; "
+                                    f"order errors={len(order)}, missing={list((reference - remaining).elements())!r}, "
+                                    f"unexpected={list((remaining - reference).elements())!r}")
+                    continue
+            print(f"{suite}/{name}: ok", flush=True)
+        return observed
+
+    def mutate():
+        envelope = copy.deepcopy(baseline)
+        return envelope, envelope["data"]["runner_result"]["steps"]
+
+    valid_diagnostics = check("valid_nullable_evidence", baseline)
+    for channel, key, diagnostic in (
+        ("sandbox_check", "errno", "missing sandbox_check.errno"),
+        ("sandbox_check", "filter_type_id", "missing sandbox_check.filter_type_id"),
+        ("attempt", "rc", "missing attempt.rc"),
+        ("attempt", "errno", "missing attempt.errno"),
+        ("attempt", "observed_path", "missing attempt.observed_path"),
+    ):
+        broken, steps = mutate()
+        del steps[0][channel][key]
+        check(f"missing_{channel}_{key}", broken, (diagnostic,), status=1)
+
+    broken, steps = mutate()
+    steps[0]["sandbox_check"]["rc"] = 0
+    check("unavailable_wrong_sentinel", broken, ("expected unavailable sandbox_check.rc=-1",), status=1)
+
+    for channel, key in (("sandbox_check", "pid"), ("sandbox_check", "filter_type_id"),
+                         ("sandbox_check", "errno"), ("attempt", "errno"), ("attempt", "rc")):
+        broken, steps = mutate()
+        steps[2][channel][key] = False
+        check(f"boolean_{channel}_{key}", broken, (f"invalid {channel}.{key}",), status=1)
+
+    broken, steps = mutate()
+    steps[0]["attempt"]["rc"] = None
+    check("null_attempt_rc", broken, ("invalid attempt.rc",), status=1)
+    broken, steps = mutate()
+    steps[0]["attempt"]["errno"] = 2.0
+    check("float_errno_is_not_an_integer", broken, ("invalid attempt.errno",), status=1)
+    broken, steps = mutate()
+    steps[2]["attempt"].update(errno=1)
+    check("expected_null_errno", broken, ("fs_read_allowed: expected errno=None",), status=1)
+    for value in (None, "optional diagnostic text"):
+        changed, steps = mutate()
+        steps[0]["attempt"]["error"] = value
+        check(f"optional_attempt_error_{value is None}", changed)
+
+    # One unknown key proves this CLI reaches the shared shape allowlist;
+    # blackbox_e2e/checker_controls owns the validator's own controls.
+    broken, steps = mutate()
+    steps[2]["drift"] = None
+    check("unknown_key_reaches_consumer", broken, ("unknown key reply.steps[].drift",), status=1)
+    broken, steps = mutate()
+    steps[2]["comparison"]["limitations"].append("state_stability_unestablished")
+    check("limitation_outside_vocabulary", broken, ("limitation outside the vocabulary",), status=1)
+    broken, steps = mutate()
+    steps[2]["comparison"]["observation"] = "permission_failure"
+    check("observation_disagrees_with_attempt", broken, ("disagrees with the attempt fields",), status=1)
+
+    for name in ("duplicate", "missing", "unknown", "non_object"):
+        broken, steps = mutate()
+        if name == "duplicate":
+            steps[2]["step_id"] = steps[1]["step_id"]
+        elif name == "missing":
+            steps.pop()
+        elif name == "unknown":
+            steps[1]["step_id"] = "unrequested_step"
+        else:
+            steps[1] = None
+        check(f"{name}_step", broken, ("expected step IDs in order",), status=1)
+
+    # Reordering may add one order error, but must neither invent nor lose
+    # step failures. Compare observed diagnostics as multisets so prose and
+    # ordering can change without pinning a complete expected transcript.
+    changed, steps = mutate()
+    steps.reverse()
+    changed["data"]["runner_result"]["phases"][0]["action_ids"].reverse()
+    check("reordered_step", changed, ("expected step IDs in order",), status=1,
+          same_diagnostics_as=valid_diagnostics)
+    broken, steps = mutate()
+    steps[2]["attempt"].update(rc=1, errno=13)
+    attempt_errors = ("fs_read_allowed: expected attempt_ok=True", "fs_read_allowed: expected errno=None")
+    ordered_diagnostics = check("attribution_bad_attempt", broken, attempt_errors, status=1)
+    steps.reverse()  # The faulty step moves, while its expectation stays put.
+    broken["data"]["runner_result"]["phases"][0]["action_ids"].reverse()
+    check("reordered_bad_attempt", broken, ("expected step IDs in order", *attempt_errors), status=1,
+          same_diagnostics_as=ordered_diagnostics)
+
+    broken, steps = mutate()
+    steps[0]["sandbox_check"]["outcome"] = "deny"
+    steps[2]["attempt"].update(rc=1)
+    check("prediction_and_later_attempt", broken,
+          ("fs_read_missing: expected sandbox_check prediction_unavailable",
+           "fs_read_allowed: expected attempt_ok=True"), status=1)
+
+    broken, steps = mutate()
+    steps[0]["sandbox_check"] = None
+    steps[0]["attempt"].update(rc=0)
+    del steps[2]["attempt"]
+    check("independent_malformed_channels", broken,
+          ("missing sandbox_check for fs_read_missing", "fs_read_missing: expected attempt_ok=False",
+           "missing attempt for fs_read_allowed"), status=1)
+
+    for key in ("result", "data"):
+        broken, _ = mutate()
+        broken[key] = []
+        check(f"malformed_{key}", broken, (f"{key} is not an object",), status=1)
+
+    # The shared checks accept the documented nullable filter type on explicit
+    # error/sentinel results. Neither suite may silently skip their attempts.
+    for outcome, errno in (("deny", 0), ("error", 5), ("unsupported_operation", 22)):
+        changed, steps = mutate()
+        steps[1]["sandbox_check"].update(outcome=outcome, rc=1 if outcome == "deny" else -1,
+                                         native_rc=1 if outcome == "deny" else -1,
+                                         filter_type_id=2 if outcome == "deny" else None, errno=errno,
+                                         error=None if outcome == "deny" else "validator control failure")
+        for record in changed["data"]["runner_result"]["phases"][0]["validator_subprocess"]["records"]:
+            if record["step_id"] == steps[1]["step_id"]:
+                record.update(outcome=outcome, rc=1 if outcome == "deny" else -1, errno=errno)
+        if outcome != "deny":
+            # An error verdict has no eligible native record, so the row claims no order.
+            steps[1]["comparison"]["order"] = "unestablished"
+        expected = copy.deepcopy(expectations)
+        expected["blackbox_e2e"]["steps"][1]["sandbox_outcome"] = outcome
+        expected["blackbox_menagerie"]["steps"][1]["expect"]["predict"] = outcome
+        check(f"explicit_{outcome}", changed, expected=expected)
+
+    # Envelope requirements remain choices made by each suite.
+    changed, _ = mutate()
+    del changed["data"]["runner_result"]["policy_sha256"]
+    check("optional_hash", changed, suites=("blackbox_e2e",))
+    check("required_hash", changed, ("expected policy_sha256 to be present",),
+          suites=("blackbox_menagerie",), status=1)
+
+    # A pending host-dependent mismatch skip must wait for every assertion.
+    # The first step intentionally has no attempt_ok expectation here.
+    expected = copy.deepcopy(expectations)
+    first = expected["blackbox_menagerie"]["steps"][0]["expect"]
+    del first["attempt_ok"]
+    first.update(policy="deny", mismatch_reason="control_boundary")
+    check("unobserved_mismatch", baseline, ("expected mismatch (control_boundary) not observed",),
+          expected=expected, suites=("blackbox_menagerie",), status=3)
+    broken, steps = mutate()
+    steps[2]["attempt"].update(rc=1)
+    check("pending_skip_and_later_failure", broken, ("fs_read_allowed: expected attempt_ok=True",),
+          expected=expected, suites=("blackbox_menagerie",), status=1)
+    first["policy"] = "allow"
+    check("observed_mismatch", baseline, ("mismatch evidence: fs_read_missing:control_boundary",),
+          expected=expected, suites=("blackbox_menagerie",))
+    del first["mismatch_reason"]
+    check("unannotated_mismatch", baseline, ("fs_read_missing: policy=allow but attempt_ok=False",),
+          expected=expected, suites=("blackbox_menagerie",), status=1)
+
+    expected = copy.deepcopy(expectations)
+    expected["blackbox_menagerie"]["steps"][2]["attempt"] = {
+        "kind": "file", "action": "open_read", "target": allowed_read["target"]}
+    check("file_observation", baseline, expected=expected, suites=("blackbox_menagerie",))
+    broken, steps = mutate()
+    steps[2]["attempt"]["observed_path"] = None
+    check("missing_file_observation", broken, ("expected observed_path for successful open/create",),
+          expected=expected, suites=("blackbox_menagerie",), status=1)
+    broken, steps = mutate()
+    steps[2]["attempt"]["requested_path"] = "/wrong/target"
+    check("wrong_file_target", broken, ("expected requested_path",),
+          expected=expected, suites=("blackbox_menagerie",), status=1)
+
+    expected = copy.deepcopy(expectations)
+    expected["blackbox_e2e"]["steps"][1].update(expect_denial=False)
+    check("denial_classification", baseline, expected=expected, suites=("blackbox_e2e",))
+    broken, steps = mutate()
+    steps[1]["sandbox_check"].update(outcome="deny", rc=1, native_rc=1)
+    expected["blackbox_e2e"]["steps"][1]["sandbox_outcome"] = "deny"
+    check("wrong_denial_classification", broken, ("expected denial=False",),
+          expected=expected, suites=("blackbox_e2e",), status=1)
+    # The document version is read exactly: another reply version is one error.
+    broken, _ = mutate()
+    broken["data"]["runner_result"]["schema_version"] += 1
+    check("unsupported_reply_version", broken, ("unsupported runner response",), status=1)
+
+    if failures:
+        raise SystemExit("\n".join(failures))
+    print(f"{count} checker controls passed")
+
+
+if __name__ == "__main__":
+    main()

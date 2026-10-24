@@ -1,0 +1,25 @@
+{
+  "policy_format": "sbpl",
+  "require_sandboxed_after_apply": true,
+  "require_policy_sha256": false,
+  "steps": [
+    {
+      "step_id": "fs_write_allowed",
+      "sandbox_outcome": "allow",
+      "attempt_ok": true,
+      "expect_denial": false
+    },
+    {
+      "step_id": "fs_write_denied",
+      "sandbox_outcome": "deny",
+      "attempt_ok": false,
+      "expect_denial": true
+    },
+    {
+      "step_id": "mach_lookup_denied",
+      "sandbox_outcome": "deny",
+      "attempt_ok": false,
+      "expect_denial": true
+    }
+  ]
+}

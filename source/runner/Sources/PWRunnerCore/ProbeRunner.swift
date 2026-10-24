@@ -1,0 +1,204 @@
+import Foundation
+import Darwin
+
+// Query admission and the shared planner exclusion set. The host validates
+// the submitted queries and decides which of them the validator child asks
+// about; it performs no sandbox query or attempt of its own.
+
+// Filter kinds the runner knows how to validate, predict, and route to
+// the sb_api_validator. Unknown names refuse the whole request before attempts.
+let knownFilterKinds: Set<String> = [
+    PWRunnerWire.sandboxFilterNone,
+    PWRunnerWire.sandboxFilterPath,
+    PWRunnerWire.sandboxFilterGlobalName,
+    PWRunnerWire.sandboxFilterLocalName,
+    PWRunnerWire.sandboxFilterIokitRegistryEntryClass,
+    PWRunnerWire.sandboxFilterIokitUserClientClass,
+    PWRunnerWire.sandboxFilterSysctlName,
+]
+
+func sandboxCheckFailure(_ steps: [PWRunnerProbeStep]) -> PWRunnerRequestFailure? {
+    for (index, step) in steps.enumerated() {
+        let path = ["probe_plan", String(index), "sandbox_check"]
+        let op = step.sandbox_check.operation.trimmingCharacters(in: .whitespacesAndNewlines)
+        if op.isEmpty {
+            return PWRunnerRequestFailure(code: "empty_operation", path: path + ["operation"])
+        }
+        let kind = step.sandbox_check.filter.kind
+        guard knownFilterKinds.contains(kind) else {
+            return PWRunnerRequestFailure(code: "unknown_filter_kind", path: path + ["filter", "kind"])
+        }
+        let needsValue = kind != PWRunnerWire.sandboxFilterNone
+        if needsValue {
+            let value = step.sandbox_check.filter.value?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if value == nil || value == "" {
+                return PWRunnerRequestFailure(code: "missing_filter_value", path: path + ["filter", "value"])
+            }
+        } else if step.sandbox_check.filter.value != nil {
+            return PWRunnerRequestFailure(code: "inapplicable_field", path: path + ["filter", "value"])
+        }
+    }
+    return nil
+}
+
+func validateSandboxChecks(_ steps: [PWRunnerProbeStep]) throws {
+    if let failure = sandboxCheckFailure(steps) { throw failure }
+}
+
+/// Meanings that structural decoding cannot express. Run after capacity checks
+/// and before either child is created, at both host orchestration entry points.
+/// Query and attempt scopes need not match; a known but unavailable prediction
+/// still permits a supported attempt and an honest unavailable observation.
+func requestMeaningFailure(_ spec: PWRunnerRunSpec) -> PWRunnerRequestFailure? {
+    if let augments = spec.policy.augments, !augments.isEmpty {
+        return PWRunnerRequestFailure(code: "unresolved_augments", path: ["policy", "augments"])
+    }
+    if spec.policy.format != PWRunnerWire.policyFormatSbpl {
+        return PWRunnerRequestFailure(code: "unsupported_policy_format", path: ["policy", "format"])
+    }
+    if spec.policy.sbpl_source == nil {
+        return PWRunnerRequestFailure(code: "missing_policy_source", path: ["policy", "sbpl_source"])
+    }
+    if spec.policy.capture_compiled_profile == true {
+        if captureNonceBytes(spec.policy.capture_nonce) == nil {
+            return PWRunnerRequestFailure(code: "invalid_capture_nonce", path: ["policy", "capture_nonce"])
+        }
+    } else if spec.policy.capture_nonce != nil {
+        return PWRunnerRequestFailure(code: "inapplicable_field", path: ["policy", "capture_nonce"])
+    }
+    var phaseIDs = Set<String>()
+    if let phases = spec.phases {
+        if phases.isEmpty { return PWRunnerRequestFailure(code: "empty_phases", path: ["phases"]) }
+        for (index, phase) in phases.enumerated() {
+            if phase.phase_id.isEmpty { return PWRunnerRequestFailure(code: "empty_phase_id", path: ["phases", String(index), "phase_id"]) }
+            if !phaseIDs.insert(phase.phase_id).inserted {
+                return PWRunnerRequestFailure(code: "duplicate_phase_id", path: ["phases", String(index), "phase_id"])
+            }
+        }
+    }
+    if let failure = extensionMeaningFailure(spec) { return failure }
+    if var failure = sandboxCheckFailure(spec.probe_plan) {
+        if let path = failure.path, path.count >= 2, let index = Int(path[1]) {
+            failure.path = spec.probePath(index) + path.dropFirst(2)
+        }
+        return failure
+    }
+    var ids = Set<String>()
+    for (index, step) in spec.probe_plan.enumerated() {
+        let path = spec.probePath(index)
+        if !ids.insert(step.step_id).inserted {
+            return PWRunnerRequestFailure(code: "duplicate_step_id", path: path + ["step_id"])
+        }
+        guard let kind = mapAttemptKindOrNil(step.attempt) else {
+            return PWRunnerRequestFailure(code: "unsupported_attempt", path: path + ["attempt"])
+        }
+        if kind != .execSpawn && step.attempt.args != nil {
+            return PWRunnerRequestFailure(code: "inapplicable_field", path: path + ["attempt", "args"])
+        }
+        if kind == .execSpawn && !step.attempt.target.hasPrefix("/") {
+            return PWRunnerRequestFailure(code: "relative_exec_target", path: path + ["attempt", "target"])
+        }
+    }
+    return nil
+}
+
+func requestRefusalReply(parsed: PWRunnerRunSpec, failure: PWRunnerRequestFailure,
+                         bundleId: String?, policyHash: String? = nil) -> PWRunnerRunResult {
+    PWRunnerRunResult(specimen_id: parsed.specimen_id, run_kind: parsed.run_kind,
+        rc: 1, normalized_outcome: NormalizedOutcome.badRequest, error: failure.description,
+        pid: Int(getpid()), bundle_id: bundleId, policy_format: parsed.policy.format,
+        policy_sha256: policyHash, steps: [], test_overrides: parsed._test_overrides,
+        request_failure: failure)
+}
+
+// (operation, filter_kind) pairs the planner excludes from the validator
+// batch: for each, no filter ID in 1..200 produced a sandbox_check verdict
+// matching kernel enforcement under verify_filter_id.sh, so no prediction is
+// requested and the step records `query_plan:prediction_unavailable_pair`.
+// The attempt channel still runs.
+//
+// Keyed by (operation, filter_kind), not by filter_kind alone: the
+// verification is op+filter-specific. A specimen pairing one of these filter
+// kinds with a different operation gets the normal query.
+//
+// Entries here must be paired with an enforcement_probe verification
+// commit naming the op+filter pair and the empirical evidence.
+struct PredictionUnavailablePair: Hashable {
+    let operation: String
+    let filterKind: String
+}
+
+let predictionUnavailableOpFilters: Set<PredictionUnavailablePair> = [
+    // iokit-open-service + iokit-registry-entry-class: verified
+    // 2026-05-29 against IOSurfaceRoot; no filter ID in 1..200
+    // produced a sandbox_check verdict matching kernel enforcement.
+    .init(operation: "iokit-open-service",
+          filterKind: PWRunnerWire.sandboxFilterIokitRegistryEntryClass),
+    // iokit-open-user-client + iokit-user-client-class: verified
+    // 2026-05-29 with policy filter value IOSurfaceRootUserClient
+    // and probe target IOSurfaceRoot. The earlier "verification"
+    // (pre-audit) used operation iokit-open-service, which is the
+    // wrong SBPL operation for this filter — both operations fire
+    // when IOServiceOpen is called, but iokit-user-client-class
+    // matches against the open-user-client operation. With the
+    // corrected pairing the kernel enforces the deny (kr=
+    // kIOReturnNotPermitted) and no sandbox_check filter ID in
+    // 1..200 produces a verdict that agrees with the kernel.
+    .init(operation: "iokit-open-user-client",
+          filterKind: PWRunnerWire.sandboxFilterIokitUserClientClass),
+    // sysctl-read + sysctl-name: verified 2026-05-29 against
+    // kern.osrelease; same pattern as iokit, so the mismatch is not
+    // iokit-specific.
+    .init(operation: "sysctl-read",
+          filterKind: PWRunnerWire.sandboxFilterSysctlName),
+    // Conservative capability limit: the local-name investigation did not
+    // establish a lookup governed by that rule, so no filter ID is calibrated
+    // against a matched native operation. ID 3 is only a query candidate;
+    // the former ID 17 did not discriminate in the reported scan. See
+    // tests/suites/witness_contract/harness/VERIFICATIONS.md for the open gate.
+    .init(operation: "mach-lookup",
+          filterKind: PWRunnerWire.sandboxFilterLocalName),
+]
+
+// Fixed one-token/one-handle semantics; no general dependency graph.
+func extensionMeaningFailure(_ spec: PWRunnerRunSpec) -> PWRunnerRequestFailure? {
+    func fail(_ code: String, _ path: [String]) -> PWRunnerRequestFailure { .init(code: code, path: path) }
+    let declarations = spec.extensions ?? []
+    if !declarations.isEmpty && spec.phases == nil { return fail("extensions_require_phases", ["extensions"]) }
+    if let declaration = declarations.first, declaration.token_ref.isEmpty {
+        return fail("empty_reference", ["extensions", "0", "token_ref"])
+    }
+    if !declarations.isEmpty && spec.probe_plan.contains(where: { $0.attempt.kind == "exec" }) {
+        return fail("extension_exec_unsupported", ["phases"])
+    }
+    var identities = Set<String>()
+    var consumedHandle: String?
+    var releaseSeen = false
+    for (pi, phase) in spec.executionPhases.enumerated() {
+        for (ai, action) in phase.actions.enumerated() {
+            let path = spec.phases == nil ? ["probe_plan", String(ai)] : ["phases", String(pi), "actions", String(ai)]
+            if !identities.insert(action.stepID).inserted { return fail("duplicate_step_id", path + ["step_id"]) }
+            guard case .extensionAction(let value) = action else { continue }
+            if value.step_id.isEmpty { return fail("empty_step_id", path + ["step_id"]) }
+            let op = value.intervention
+            if op.handle_ref.isEmpty { return fail("empty_reference", path + ["extension", "handle_ref"]) }
+            switch op.operation {
+            case "consume":
+                if consumedHandle != nil { return fail("repeated_consume", path + ["extension"]) }
+                guard let token = declarations.first?.token_ref, op.token_ref == token else {
+                    return fail("unknown_token_reference", path + ["extension", "token_ref"])
+                }
+                if op.handle_ref == token { return fail("duplicate_reference", path + ["extension", "handle_ref"]) }
+                consumedHandle = op.handle_ref
+            case "release":
+                if releaseSeen { return fail("repeated_release", path + ["extension"]) }
+                if op.token_ref != nil { return fail("inapplicable_field", path + ["extension", "token_ref"]) }
+                guard let handle = consumedHandle else { return fail("release_before_consume", path + ["extension"]) }
+                if op.handle_ref != handle { return fail("unknown_handle_reference", path + ["extension", "handle_ref"]) }
+                releaseSeen = true
+            default: return fail("unsupported_extension_action", path + ["extension", "operation"])
+            }
+        }
+    }
+    return nil
+}

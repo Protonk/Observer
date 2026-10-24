@@ -1,0 +1,980 @@
+/*
+ * tests/suites/runner_c_worker_harness/harness.c — drives
+ * pw-probe-runner in isolation and reports the result envelope to
+ * stdout as a single JSON object. Built and run by the suite's
+ * run.sh; not meant to be invoked by hand outside of that path.
+ *
+ * Usage:
+ *   harness <worker_path> <scenario>
+ *     scenario: happy_default_allow | bare_deny_default | terminal_exit_without_request |
+ *               max_slots_deny_default | sigkill_fallback
+ *
+ * The harness:
+ *  1. Builds the host side: shm_open + ftruncate + mmap, populate
+ *     header + per-scenario slots, set prepared=1.
+ *  2. posix_spawn pw-probe-runner with --shm-fd=3, --ready-fd=4,
+ *     stdin = pipe carrying the per-scenario policy.
+ *  3. Reads the pre-apply ready byte.
+ *  4. Polls applied + done sentinels with a bounded deadline.
+ *  5. Sets exit_requested and waits for the worker to _exit(0)
+ *     (or times out — that's a fail).
+ *  6. Prints one JSON object: { ready_byte_received, applied,
+ *     apply_rc, done, exit_status, term_signal, slots: [...] }.
+ *     The bash driver asserts shape from there.
+ *
+ * Exit codes:
+ *   0 — scenario ran to completion; JSON on stdout is the result.
+ *       Per-scenario success criteria are evaluated by the bash
+ *       driver, not here.
+ *   1 — host-side setup failure (shm_open, posix_spawn, etc).
+ *       JSON may be partial or absent; diagnostic on stderr.
+ *   2 — usage error.
+ */
+
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <spawn.h>
+#include <stdatomic.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "pw_probe_runner_abi.h"
+
+extern char **environ;
+
+/* exec_inheritance is driven by runner_exec_inheritance/check.py. Only this
+ * adapter knows the worker ABI; the inspection helper and assertions do not. */
+static const char *exec_helper;
+static const char *exec_nonce;
+static const char *exec_canary_fd;
+
+static void populate_exec_inheritance(pw_shm_slot_t *slots) {
+    for (unsigned i = 0; i < 3; i++) {
+        pw_shm_slot_t *s = &slots[i];
+        snprintf(s->step_id, sizeof(s->step_id), "inspect_%u", i);
+        s->attempt_kind = PW_ATTEMPT_EXEC_SPAWN;
+        snprintf(s->target, sizeof(s->target), "%s", exec_helper);
+        s->argv_count = 5;
+        snprintf(s->argv[0], sizeof(s->argv[0]), "%s", exec_helper);
+        snprintf(s->argv[1], sizeof(s->argv[1]), "--inspect");
+        snprintf(s->argv[2], sizeof(s->argv[2]), "%s-%u", exec_nonce, i);
+        snprintf(s->argv[3], sizeof(s->argv[3]), "--read-fd");
+        snprintf(s->argv[4], sizeof(s->argv[4]), "%s", exec_canary_fd);
+    }
+}
+
+/* ---- scenarios ----------------------------------------------------------- */
+
+/* Temp-target lifecycle for the file attempt scenarios. The harness
+ * owns the on-disk file (it is unsandboxed); the worker is what runs
+ * the unlink/create under the scenario's policy. */
+typedef enum {
+    TEMP_NONE = 0,        /* scenario uses a fixed target (or none) */
+    TEMP_PRECREATE,       /* harness creates the file; expect unlink (or deny) */
+    TEMP_ENSURE_ABSENT,   /* harness removes the file; expect the worker to create it */
+} temp_target_mode_t;
+
+typedef struct {
+    const char *name;
+    const char *policy;
+    uint32_t step_count;
+    int request_exit;
+    /* Populates the slots according to scenario semantics. */
+    void (*populate_slots)(pw_shm_slot_t *slots);
+    /* Optional: populates params + returns the populated count
+     * (0..PW_SHM_MAX_PARAMS). NULL means "no params, leave region zero". */
+    uint32_t (*populate_params)(pw_shm_param_t *params);
+
+    /* ---- negative / corruption knobs (all default 0 = off) ----
+     * These drive the worker's pre-apply self-defense branches over a
+     * corrupted shm header. E2e the host always populates that header
+     * correctly, so the harness — which pipes policy straight to the
+     * worker — is the only vehicle that can reach them. */
+    int corrupt_abi;               /* 1: change last identity byte; 2: ordinal magic; both exit 4 */
+    int skip_prepared;             /* leave hdr->prepared = 0     → worker exits 5 */
+    uint32_t override_step_count;  /* if !=0, force hdr->step_count after populate (overflow → exit 6) */
+    uint32_t override_param_count; /* if !=0, force hdr->param_count after populate (overflow → exit 8) */
+    int oversize_policy;           /* pipe > POLICY_MAX bytes      → worker exits 7 */
+
+    /* On-disk target lifecycle for the file unlink/create scenarios. */
+    temp_target_mode_t temp_target;
+    int withhold_proceed, proceed_delay_ms, proceed_at_prepare, proceed_after_expiry;
+    int proceed_wait_ms;
+
+    /* Descriptor limits set on the harness, and inherited by the worker,
+     * right before spawn; 0 keeps the inherited value. Lowering the hard
+     * limit is irreversible for this process, which runs one scenario. A
+     * ceiling the plan's exec steps could not share proves that exec pipes
+     * exist only inside each attempt. */
+    unsigned rlimit_soft, rlimit_hard;
+
+    /* Pipe "(version 1)(allow default)" NUL "(deny default)" → worker exits 9. */
+    int nul_policy;
+
+    /* Exec attempt budget controls, passed as harness-only worker flags when
+     * nonzero. poll_deadline_ms widens the applied/done poll (0 keeps 2 s).
+     * Positional rows spell these out as zero; the budget rows use designated
+     * initializers. */
+    long exec_attempt_budget_ms, exec_child_deadline_ms;
+    int poll_deadline_ms;
+
+    /* Transport truncation: pipe only the bytes of `policy` that precede this
+     * substring, then close. The header still carries the whole submission's
+     * byte count, so the worker's length comparison is what tells the prefix
+     * apart from a complete shorter submission. NULL pipes the whole policy. */
+    const char *truncate_before;
+    /* Overdelivery: bytes appended to the pipe after the submission, so the
+     * worker reads more than the header's expectation. NULL appends nothing. */
+    const char *deliver_extra;
+    /* Header expectation override. When set, hdr->policy_bytes_expected carries
+     * this value instead of the submission's byte count; zero is a valid
+     * override. The overflow control pins it at the capacity so read overflow
+     * stays reachable instead of the header refusing an impossible length. */
+    int expected_override_set;
+    uint32_t expected_override;
+    /* Pad the submission with trailing spaces to exactly this many bytes (0
+     * keeps the text as written). Spaces are SBPL whitespace, so a padded
+     * valid policy stays valid; PW_SHM_POLICY_BYTES - 1 fills the worker's
+     * source buffer exactly and one byte more overflows it. */
+    size_t pad_to_bytes;
+} scenario_t;
+
+static void populate_happy(pw_shm_slot_t *slots) {
+    /* One slot: read /etc/hosts. Under (allow default) this succeeds
+     * and the slot reports observed_path == /private/etc/hosts. */
+    snprintf(slots[0].step_id, sizeof(slots[0].step_id), "read_etc_hosts");
+    slots[0].attempt_kind = PW_ATTEMPT_FILE_OPEN_READ;
+    snprintf(slots[0].target, sizeof(slots[0].target), "/etc/hosts");
+}
+
+static void populate_deny_default(pw_shm_slot_t *slots) {
+    /* One slot: read /etc/hosts under bare (deny default). The
+     * worker still completes; the slot reports rc=1 with errno
+     * = EACCES/EPERM because the kernel denied the open. */
+    snprintf(slots[0].step_id, sizeof(slots[0].step_id), "read_etc_hosts_denied");
+    slots[0].attempt_kind = PW_ATTEMPT_FILE_OPEN_READ;
+    snprintf(slots[0].target, sizeof(slots[0].target), "/etc/hosts");
+}
+
+/* Exec slots that spawn /usr/bin/true. Held open together, 32 pipe pairs
+ * would need 128 descriptors, twice the 64-descriptor ceiling the
+ * per-attempt scenario imposes; created per attempt they need four. */
+#define EXEC_TRUE_SLOTS 32u
+static void populate_exec_true_n(pw_shm_slot_t *slots, uint32_t count) {
+    for (uint32_t i = 0; i < count; i++) {
+        pw_shm_slot_t *s = &slots[i];
+        snprintf(s->step_id, sizeof(s->step_id), "true_%03u", i);
+        s->attempt_kind = PW_ATTEMPT_EXEC_SPAWN;
+        snprintf(s->target, sizeof(s->target), "/usr/bin/true");
+        s->argv_count = 1;
+        snprintf(s->argv[0], sizeof(s->argv[0]), "/usr/bin/true");
+    }
+}
+static void populate_exec_true(pw_shm_slot_t *slots) { populate_exec_true_n(slots, EXEC_TRUE_SLOTS); }
+static void populate_exec_true_single(pw_shm_slot_t *slots) { populate_exec_true_n(slots, 1u); }
+
+/* Reads surround the exec steps so a real system import and file probes
+ * share the capped descriptor table with the exec attempts. */
+static void populate_exec_mixed(pw_shm_slot_t *slots) {
+    populate_happy(slots);
+    populate_exec_true(slots + 1);
+    populate_happy(slots + EXEC_TRUE_SLOTS + 1);
+    snprintf(slots[EXEC_TRUE_SLOTS + 1].step_id, sizeof(slots[0].step_id), "read_after_exec");
+}
+
+/* Deadline-hitting helpers: /bin/sleep outlives every deadline the budget
+ * scenarios grant. A trailing read proves the plan continues past refusals. */
+#define EXEC_SLEEP_SLOTS 6u
+static void populate_exec_budget(pw_shm_slot_t *slots) {
+    for (uint32_t i = 0; i < EXEC_SLEEP_SLOTS; i++) {
+        pw_shm_slot_t *s = &slots[i];
+        snprintf(s->step_id, sizeof(s->step_id), "sleep_%03u", i);
+        s->attempt_kind = PW_ATTEMPT_EXEC_SPAWN;
+        snprintf(s->target, sizeof(s->target), "/bin/sleep");
+        s->argv_count = 2;
+        snprintf(s->argv[0], sizeof(s->argv[0]), "/bin/sleep");
+        snprintf(s->argv[1], sizeof(s->argv[1]), "30");
+    }
+    populate_happy(slots + EXEC_SLEEP_SLOTS);
+    snprintf(slots[EXEC_SLEEP_SLOTS].step_id, sizeof(slots[0].step_id), "read_after_budget");
+}
+
+static void populate_max_slots(pw_shm_slot_t *slots) {
+    for (uint32_t i = 0; i < PW_SHM_MAX_STEPS; i++) {
+        snprintf(slots[i].step_id, sizeof(slots[i].step_id), "none_%03u", i);
+        slots[i].attempt_kind = PW_ATTEMPT_NONE;
+        slots[i].target[0] = '\0';
+    }
+}
+
+/* Populate one slot that reads /etc/hosts and one param TARGET=/etc.
+ * Paired with SCEN_PARAMS_ROUND_TRIP_POLICY below. */
+static void populate_params_slot(pw_shm_slot_t *slots) {
+    snprintf(slots[0].step_id, sizeof(slots[0].step_id), "read_etc_hosts_param_target");
+    slots[0].attempt_kind = PW_ATTEMPT_FILE_OPEN_READ;
+    snprintf(slots[0].target, sizeof(slots[0].target), "/etc/hosts");
+}
+
+static uint32_t populate_params_target(pw_shm_param_t *params) {
+    snprintf(params[0].key, sizeof(params[0].key), "TARGET");
+    /* Subpath match in SBPL is against the kernel-canonical form, not
+     * userspace aliases — /etc/hosts realpaths to /private/etc/hosts,
+     * so TARGET must be /private/etc for the deny rule to fire. This
+     * is an SBPL semantic detail, not a worker concern; the test
+     * documents it inline so a future reader doesn't waste time
+     * debugging it again. */
+    snprintf(params[0].value, sizeof(params[0].value), "/private/etc");
+    return 1u;
+}
+
+/* Unlink + create slots. step_id + attempt_kind only; the harness fills
+ * slots[0].target with the temp path it owns (see temp_target handling in
+ * run_scenario), so these leave target empty. */
+static void populate_unlink(pw_shm_slot_t *slots) {
+    snprintf(slots[0].step_id, sizeof(slots[0].step_id), "unlink_temp_target");
+    slots[0].attempt_kind = PW_ATTEMPT_FILE_UNLINK;
+    slots[0].target[0] = '\0';
+}
+
+static void populate_create(pw_shm_slot_t *slots) {
+    snprintf(slots[0].step_id, sizeof(slots[0].step_id), "create_temp_target");
+    slots[0].attempt_kind = PW_ATTEMPT_FILE_CREATE;
+    slots[0].target[0] = '\0';
+}
+
+/* Allow file-read but (deny default) — the worker can read /etc/hosts
+ * but everything else is denied. Lets the happy_default_allow case run
+ * under a maximally-restrictive policy that still permits the probe;
+ * exercises the post-apply minimal syscall surface. */
+static const char SCEN_ALLOW_DEFAULT_POLICY[] =
+    "(version 1)\n"
+    "(allow default)\n";
+
+/* The downstream bug-report shape: (deny default) with nothing else.
+ * The C worker must keep its shared-memory writes + spin loop alive
+ * under this profile. */
+static const char SCEN_DENY_DEFAULT_POLICY[] =
+    "(version 1)\n"
+    "(deny default)\n";
+
+/* Default-allow with one deny rule whose subpath is taken from the
+ * TARGET param. Without sandbox_set_param + a compatible params
+ * object, sandbox_compile_string fails because (param "TARGET")
+ * resolves to nothing. With it, the policy denies file-read-data
+ * under /etc — so the /etc/hosts open fails with EPERM. Either
+ * outcome proves the param round-tripped:
+ *   - compile failure ⇒ params object wasn't built correctly,
+ *   - kernel allow on /etc/hosts ⇒ param value didn't reach the
+ *     compiled profile,
+ *   - kernel deny on /etc/hosts ⇒ params are live.
+ */
+static const char SCEN_PARAMS_ROUND_TRIP_POLICY[] =
+    "(version 1)\n"
+    "(allow default)\n"
+    "(deny file-read-data (subpath (param \"TARGET\")))\n";
+
+/* Deliberately malformed: a missing close paren makes
+ * sandbox_compile_string fail. Exercises the worker's compile-failure
+ * branch — apply_rc=-1, done flips, applied stays 0, and the worker
+ * still clean-exits on the exit byte rather than dying. This is the same
+ * worker publication that the host interprets as a legacy runner_failed
+ * status. The status alone cannot distinguish compilation, parameter setup,
+ * and application failures; this harness tests the real compilation branch
+ * in isolation without host/XPC classification. */
+static const char SCEN_COMPILE_FAILURE_POLICY[] =
+    "(version 1)\n"
+    "(allow default";
+
+/* Valid placeholder; the oversize_policy flag makes run_scenario pipe a
+ * >POLICY_MAX buffer instead, so this text is never what the worker reads. */
+static const char SCEN_POLICY_OVERFLOW_PLACEHOLDER[] =
+    "(version 1)\n(allow default)\n";
+
+/* A submission whose prefix is itself a complete, compilable policy. Cut
+ * before the deny-default tail, the pipe delivers an allow-default policy and
+ * then EOF; nothing tells the worker that more bytes were meant to follow.
+ * The /etc/hosts slot discriminates which policy the kernel enforces: the
+ * open succeeds under the delivered prefix and is denied under the submitted
+ * whole. This is the worker's view of a host policy_transfer_timeout whose
+ * bytes_written fell short of bytes_expected. */
+static const char SCEN_TRUNCATED_PREFIX_POLICY[] =
+    "(version 1)\n"
+    "(allow default)\n"
+    "(deny default)\n";
+
+/* A valid source whose comment carries multibyte UTF-8. The expectation and
+ * the receipt count bytes, not characters: 40 bytes for 37 characters. */
+static const char SCEN_UTF8_POLICY[] =
+    "(version 1)\n"
+    "(allow default)\n"
+    "; caf\xc3\xa9 \xe2\x9c\x93\n";
+
+static scenario_t SCENARIOS[] = {
+    { "proceed_never_set", SCEN_ALLOW_DEFAULT_POLICY, 1, 1, populate_happy, NULL, 0, 0, 0, 0, 0, TEMP_NONE, 1, 0, 0, 0, 100 , 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, 0 },
+    { "proceed_late_after_expiry", SCEN_ALLOW_DEFAULT_POLICY, 1, 1, populate_happy, NULL, 0, 0, 0, 0, 0, TEMP_NONE, 1, 0, 0, 1, 100 , 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, 0 },
+    { "proceed_before_applied", SCEN_DENY_DEFAULT_POLICY, 1, 1, populate_deny_default, NULL, 0, 0, 0, 0, 0, TEMP_NONE, 0, 0, 1, 0, 2000 , 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, 0 },
+    { "proceed_delayed_observed_quiescence", SCEN_ALLOW_DEFAULT_POLICY, 1, 1, populate_happy, NULL, 0, 0, 0, 0, 0, TEMP_NONE, 0, 500, 0, 0, 2000 , 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, 0 },
+    { "proceed_under_bare_deny_default", SCEN_DENY_DEFAULT_POLICY, 1, 1, populate_deny_default, NULL, 0, 0, 0, 0, 0, TEMP_NONE, 0, 500, 0, 0, 2000 , 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, 0 },
+    { "proceed_wait_budget_short", SCEN_ALLOW_DEFAULT_POLICY, 1, 1, populate_happy, NULL, 0, 0, 0, 0, 0, TEMP_NONE, 0, 500, 0, 1, 100 , 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, 0 },
+    { "proceed_wait_budget_long", SCEN_ALLOW_DEFAULT_POLICY, 1, 1, populate_happy, NULL, 0, 0, 0, 0, 0, TEMP_NONE, 0, 500, 0, 0, 2000 , 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, 0 },
+    { "proceed_expiry_release_boundary", SCEN_ALLOW_DEFAULT_POLICY, 1, 1, populate_happy, NULL, 0, 0, 0, 0, 0, TEMP_NONE, 0, 100, 0, 1, 100 , 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, 0 },
+    { "proceed_without_host_release", SCEN_ALLOW_DEFAULT_POLICY, 1, 0, populate_happy, NULL, 0, 0, 0, 0, 0, TEMP_NONE, 1, 0, 0, 0, 100 , 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, 0 },
+    { "max_slots_proceed", SCEN_ALLOW_DEFAULT_POLICY, 256, 1, populate_max_slots, NULL, 0, 0, 0, 0, 0, TEMP_NONE, 0, 500, 0, 0, 2000 , 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, 0 },
+
+    /* name, policy, step_count, request_exit, populate_slots, populate_params,
+     * corrupt_abi, skip_prepared, override_step_count, override_param_count,
+     * oversize_policy, temp_target */
+    { "happy_default_allow",    SCEN_ALLOW_DEFAULT_POLICY, 1,                1, populate_happy,        NULL,                   0, 0, 0, 0, 0, TEMP_NONE, 0, 0, 0, 0, 0 , 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, 0 },
+    { "exec_inheritance",       SCEN_ALLOW_DEFAULT_POLICY, 3,                1, populate_exec_inheritance, NULL,               0, 0, 0, 0, 0, TEMP_NONE, 0, 0, 0, 0, 0 , 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, 0 },
+    { "bare_deny_default",      SCEN_DENY_DEFAULT_POLICY,  1,                0, populate_deny_default, NULL,                   0, 0, 0, 0, 0, TEMP_NONE, 0, 0, 0, 0, 0 , 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, 0 },
+    { .name = "terminal_empty_phase", .policy = SCEN_ALLOW_DEFAULT_POLICY, .step_count = 0 },
+    { "terminal_exit_without_request",        SCEN_ALLOW_DEFAULT_POLICY, 1,                0, populate_happy,        NULL,                   0, 0, 0, 0, 0, TEMP_NONE, 0, 0, 0, 0, 0 , 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, 0 },
+    { "max_slots_deny_default", SCEN_DENY_DEFAULT_POLICY,  PW_SHM_MAX_STEPS, 1, populate_max_slots,    NULL,                   0, 0, 0, 0, 0, TEMP_NONE, 0, 0, 0, 0, 0 , 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, 0 },
+    { "sigkill_fallback",       SCEN_ALLOW_DEFAULT_POLICY, 1,                0, populate_happy,        NULL,                   0, 0, 0, 0, 0, TEMP_NONE, 0, 0, 0, 0, 0 , 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, 0 },
+    { "params_round_trip",      SCEN_PARAMS_ROUND_TRIP_POLICY, 1,            1, populate_params_slot,  populate_params_target, 0, 0, 0, 0, 0, TEMP_NONE, 0, 0, 0, 0, 0 , 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, 0 },
+
+    /* #1 — file attempt kinds with no other execution coverage. */
+    { "unlink_allow",           SCEN_ALLOW_DEFAULT_POLICY, 1,                1, populate_unlink,       NULL,                   0, 0, 0, 0, 0, TEMP_PRECREATE, 0, 0, 0, 0, 0 , 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, 0 },
+    { "unlink_deny",            SCEN_DENY_DEFAULT_POLICY,  1,                1, populate_unlink,       NULL,                   0, 0, 0, 0, 0, TEMP_PRECREATE, 0, 0, 0, 0, 0 , 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, 0 },
+    { "create_allow",           SCEN_ALLOW_DEFAULT_POLICY, 1,                1, populate_create,       NULL,                   0, 0, 0, 0, 0, TEMP_ENSURE_ABSENT, 0, 0, 0, 0, 0 , 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, 0 },
+
+    /* #2 — pre-apply self-defense / refusal branches. */
+    { "compile_failure",        SCEN_COMPILE_FAILURE_POLICY,   1,            1, populate_happy,        NULL,                   0, 0, 0, 0, 0, TEMP_NONE, 0, 0, 0, 0, 0 , 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, 0 },
+    { "abi_mismatch",           SCEN_ALLOW_DEFAULT_POLICY, 1,                1, populate_happy,        NULL,                   1, 0, 0, 0, 0, TEMP_NONE, 0, 0, 0, 0, 0 , 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, 0 },
+    { .name = "abi_magic_mismatch", .policy = SCEN_ALLOW_DEFAULT_POLICY,
+      .step_count = 1, .request_exit = 1, .populate_slots = populate_happy, .corrupt_abi = 2 },
+    { "prepared_unset",         SCEN_ALLOW_DEFAULT_POLICY, 1,                1, populate_happy,        NULL,                   0, 1, 0, 0, 0, TEMP_NONE, 0, 0, 0, 0, 0 , 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, 0 },
+    { "step_count_overflow",    SCEN_ALLOW_DEFAULT_POLICY, 1,                1, populate_happy,        NULL,                   0, 0, PW_SHM_MAX_STEPS + 1u, 0, 0, TEMP_NONE, 0, 0, 0, 0, 0 , 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, 0 },
+    { "param_count_overflow",   SCEN_ALLOW_DEFAULT_POLICY, 1,                1, populate_happy,        NULL,                   0, 0, 0, PW_SHM_MAX_PARAMS + 1u, 0, TEMP_NONE, 0, 0, 0, 0, 0 , 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, 0 },
+    /* Expectation pinned at the capacity: the worker's read overflows before
+     * EOF and keeps code 2; without the pin the header would refuse the
+     * impossible length first. */
+    { .name = "policy_overflow", .policy = SCEN_POLICY_OVERFLOW_PLACEHOLDER, .step_count = 1,
+      .request_exit = 1, .populate_slots = populate_happy, .oversize_policy = 1,
+      .expected_override_set = 1, .expected_override = PW_SHM_POLICY_BYTES - 1u },
+    { .name = "policy_nul", .policy = SCEN_ALLOW_DEFAULT_POLICY, .step_count = 1, .request_exit = 1,
+      .populate_slots = populate_happy, .nul_policy = 1 },
+
+    /* #5 — policy delivery acknowledgement. The policy pipe carries no
+     * framing; the header's expected length and the worker's EOF receipt are
+     * what join the host's write progress to what the worker read. The
+     * truncated prefix is the defect's control; the rows after it pin both
+     * directions of the comparison, the valid boundaries of the expectation,
+     * and the receipt beside the existing overflow and NUL refusals. */
+    { .name = "policy_truncated_prefix", .policy = SCEN_TRUNCATED_PREFIX_POLICY,
+      .step_count = 1, .request_exit = 1, .populate_slots = populate_happy,
+      .truncate_before = "(deny default)" },
+    { .name = "policy_whole_submission", .policy = SCEN_TRUNCATED_PREFIX_POLICY,
+      .step_count = 1, .request_exit = 1, .populate_slots = populate_deny_default },
+    { .name = "policy_utf8_bytes", .policy = SCEN_UTF8_POLICY,
+      .step_count = 1, .request_exit = 1, .populate_slots = populate_happy },
+    { .name = "policy_at_capacity", .policy = SCEN_ALLOW_DEFAULT_POLICY,
+      .step_count = 1, .request_exit = 1, .populate_slots = populate_happy,
+      .pad_to_bytes = PW_SHM_POLICY_BYTES - 1u },
+    { .name = "policy_capacity_plus_one", .policy = SCEN_ALLOW_DEFAULT_POLICY,
+      .step_count = 1, .request_exit = 1, .populate_slots = populate_happy,
+      .pad_to_bytes = PW_SHM_POLICY_BYTES, .expected_override_set = 1,
+      .expected_override = PW_SHM_POLICY_BYTES - 1u },
+    { .name = "policy_expectation_out_of_range", .policy = SCEN_ALLOW_DEFAULT_POLICY,
+      .step_count = 1, .request_exit = 1, .populate_slots = populate_happy,
+      .expected_override_set = 1, .expected_override = PW_SHM_POLICY_BYTES },
+    { .name = "policy_overdelivered", .policy = SCEN_ALLOW_DEFAULT_POLICY,
+      .step_count = 1, .request_exit = 1, .populate_slots = populate_happy,
+      .deliver_extra = "(deny default)\n" },
+    { .name = "policy_empty_expected", .policy = "",
+      .step_count = 1, .request_exit = 1, .populate_slots = populate_happy },
+    { .name = "policy_empty_short", .policy = "",
+      .step_count = 1, .request_exit = 1, .populate_slots = populate_happy,
+      .expected_override_set = 1, .expected_override = 43 },
+    { .name = "policy_zero_expected", .policy = SCEN_ALLOW_DEFAULT_POLICY,
+      .step_count = 1, .request_exit = 1, .populate_slots = populate_happy,
+      .expected_override_set = 1, .expected_override = 0 },
+
+    /* #3 — exec resources are per attempt. A hard descriptor ceiling of 64
+     * cannot hold 32 pre-opened pipe pairs, so every clean spawn around a
+     * real system import and file reads proves no exec step holds
+     * descriptors across another step's work. Under bare (deny default) the
+     * post-apply setup must succeed and posix_spawn must be the denied call. */
+    { .name = "exec_pipes_per_attempt", .policy = "(version 1)(allow default)(import \"system.sb\")",
+      .step_count = EXEC_TRUE_SLOTS + 2, .request_exit = 1, .populate_slots = populate_exec_mixed,
+      .rlimit_soft = 64, .rlimit_hard = 64 },
+    { .name = "exec_setup_post_apply_denied", .policy = SCEN_DENY_DEFAULT_POLICY,
+      .step_count = 1, .request_exit = 1, .populate_slots = populate_exec_true_single },
+
+    /* #4 — exec attempt budget. Six /bin/sleep helpers each outlive their
+     * deadline. The budget cuts the plan: the last spawned child's deadline is
+     * the remainder, later exec steps are refused before spawn, and the
+     * trailing read still completes. With the default ten-second deadline a
+     * one-second budget admits exactly one child. */
+    { .name = "exec_attempt_budget_remainder", .policy = SCEN_ALLOW_DEFAULT_POLICY,
+      .step_count = EXEC_SLEEP_SLOTS + 1, .request_exit = 1, .populate_slots = populate_exec_budget,
+      .exec_attempt_budget_ms = 1000, .poll_deadline_ms = 4000 },
+    { .name = "exec_attempt_budget_sequence", .policy = SCEN_ALLOW_DEFAULT_POLICY,
+      .step_count = EXEC_SLEEP_SLOTS + 1, .request_exit = 1, .populate_slots = populate_exec_budget,
+      .exec_attempt_budget_ms = 1500, .exec_child_deadline_ms = 500, .poll_deadline_ms = 4000 },
+};
+static const size_t SCENARIO_COUNT = sizeof(SCENARIOS) / sizeof(SCENARIOS[0]);
+
+/* ---- JSON helpers -------------------------------------------------------- */
+
+static void emit_json_string(FILE *to, const char *s) {
+    putc('"', to);
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        switch (*p) {
+        case '"':  fputs("\\\"", to); break;
+        case '\\': fputs("\\\\", to); break;
+        case '\n': fputs("\\n", to);  break;
+        case '\r': fputs("\\r", to);  break;
+        case '\t': fputs("\\t", to);  break;
+        default:   putc(*p, to);      break;
+        }
+    }
+    putc('"', to);
+}
+
+/* ---- helpers ------------------------------------------------------------- */
+
+/* Write the whole buffer, restarting on EINTR. EPIPE is success-ish: the
+ * reader (worker) closed early, which is exactly what the policy_overflow
+ * scenario expects once the worker hits its cap and exits. */
+static int write_all_tolerant(int fd, const char *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, buf + off, len - off);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EPIPE) return 0;
+            return -1;
+        }
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+/* Build the harness-owned temp path for the file unlink/create scenarios
+ * under $TMPDIR (falling back to /tmp). Fits PW_SHM_TARGET_MAX easily. */
+static void build_temp_path(const scenario_t *scen, char *out, size_t cap) {
+    const char *tmp = getenv("TMPDIR");
+    if (!tmp || !*tmp) tmp = "/tmp";
+    snprintf(out, cap, "%spw_c_harness_%d_%s.tmp",
+             tmp, (int)getpid(), scen->name);
+    /* TMPDIR may or may not have a trailing slash; normalize by only
+     * adding one when absent. */
+    if (tmp[strlen(tmp) - 1] != '/') {
+        snprintf(out, cap, "%s/pw_c_harness_%d_%s.tmp",
+                 tmp, (int)getpid(), scen->name);
+    }
+}
+
+/* ---- main ---------------------------------------------------------------- */
+
+static int run_scenario(const char *worker_path, const scenario_t *scen);
+
+int main(int argc, char **argv) {
+    /* The policy_overflow scenario stops reading after the worker hits
+     * its cap and exits; the remaining pipe write would otherwise raise
+     * SIGPIPE and kill the harness. Tolerate it as EPIPE instead. */
+    signal(SIGPIPE, SIG_IGN);
+
+    if (argc == 6 && strcmp(argv[2], "exec_inheritance") == 0) {
+        exec_helper = argv[3]; exec_nonce = argv[4]; exec_canary_fd = argv[5];
+        if (strlen(exec_helper) >= PW_SHM_ARGV_BYTES || strlen(exec_nonce) > 64) {
+            fprintf(stderr, "harness: exec_inheritance helper path is %zu bytes and the worker's argv entry holds"
+                            " at most %u; use a shorter checkout or output path (nonce %zu bytes, at most 64)\n",
+                    strlen(exec_helper), PW_SHM_ARGV_BYTES - 1u, strlen(exec_nonce));
+            return 2;
+        }
+    } else if (argc != 3 || strcmp(argv[2], "exec_inheritance") == 0) {
+        fprintf(stderr, "usage: %s <worker_path> <scenario>\n", argv[0]);
+        fprintf(stderr, "       %s <worker_path> exec_inheritance <helper> <nonce> <canary-fd>\n", argv[0]);
+        fprintf(stderr, "scenarios:");
+        for (size_t i = 0; i < SCENARIO_COUNT; i++) {
+            fprintf(stderr, " %s", SCENARIOS[i].name);
+        }
+        fputc('\n', stderr);
+        return 2;
+    }
+    for (size_t i = 0; i < SCENARIO_COUNT; i++) {
+        if (strcmp(argv[2], SCENARIOS[i].name) == 0) {
+            return run_scenario(argv[1], &SCENARIOS[i]);
+        }
+    }
+    fprintf(stderr, "unknown scenario: %s\n", argv[2]);
+    return 2;
+}
+
+static int run_scenario(const char *worker_path, const scenario_t *scen) {
+    /* Anonymous-ish shm region. shm_open returns FDs with FD_CLOEXEC
+     * set on macOS; clear it so the dup2 in the child's file actions
+     * can land on FD 3. */
+    char shm_name[64];
+    snprintf(shm_name, sizeof(shm_name), "/pw_c_harness_%d_%s", getpid(), scen->name);
+    /* Names cap at 32 chars on macOS; truncate. */
+    shm_name[31] = '\0';
+    int shm_fd = shm_open(shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
+    if (shm_fd < 0) {
+        fprintf(stderr, "harness: shm_open: %s\n", strerror(errno));
+        return 1;
+    }
+    shm_unlink(shm_name);
+    fcntl(shm_fd, F_SETFD, 0);
+    if (ftruncate(shm_fd, PW_SHM_REGION_BYTES) != 0) {
+        fprintf(stderr, "harness: ftruncate: %s\n", strerror(errno));
+        return 1;
+    }
+    void *base = mmap(NULL, PW_SHM_REGION_BYTES, PROT_READ | PROT_WRITE,
+                      MAP_SHARED, shm_fd, 0);
+    if (base == MAP_FAILED) {
+        fprintf(stderr, "harness: mmap: %s\n", strerror(errno));
+        return 1;
+    }
+    pw_shm_header_t *hdr = (pw_shm_header_t *)base;
+    pw_shm_slot_t *slots = (pw_shm_slot_t *)((char *)base + PW_SHM_HEADER_BYTES);
+    pw_shm_param_t *params = (pw_shm_param_t *)((char *)slots
+                              + ((size_t)PW_SHM_MAX_STEPS * PW_SHM_SLOT_BYTES));
+    memset(hdr, 0, sizeof(*hdr));
+    hdr->abi_magic = PW_SHM_ABI_MAGIC;
+    memcpy(hdr->abi_identity, PW_WORKER_ABI_IDENTITY, PW_SHM_ABI_IDENTITY_BYTES);
+    hdr->step_count = scen->step_count;
+    hdr->phase_count = 1;
+    hdr->phases[0].end_slot = scen->step_count;
+    if (scen->populate_slots) scen->populate_slots(slots);
+    if (scen->populate_params) {
+        hdr->param_count = scen->populate_params(params);
+    }
+
+    /* File unlink/create scenarios: the harness owns the on-disk file
+     * and writes its path into slot 0's target. PRECREATE makes the file
+     * (so the worker's unlink has something to remove, or be denied
+     * removing); ENSURE_ABSENT removes it (so the worker's create is the
+     * thing that brings it into existence). */
+    char temp_path[PW_SHM_TARGET_MAX];
+    temp_path[0] = '\0';
+    if (scen->temp_target != TEMP_NONE) {
+        build_temp_path(scen, temp_path, sizeof(temp_path));
+        if (scen->temp_target == TEMP_PRECREATE) {
+            int tfd = open(temp_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (tfd < 0) {
+                fprintf(stderr, "harness: precreate temp target %s: %s\n",
+                        temp_path, strerror(errno));
+                return 1;
+            }
+            (void)write(tfd, "seed\n", 5);
+            close(tfd);
+        } else { /* TEMP_ENSURE_ABSENT */
+            if (unlink(temp_path) != 0 && errno != ENOENT) {
+                fprintf(stderr, "harness: ensure-absent temp target %s: %s\n",
+                        temp_path, strerror(errno));
+                return 1;
+            }
+        }
+        snprintf(slots[0].target, sizeof(slots[0].target), "%s", temp_path);
+    }
+
+    /* Corruption knobs — applied after normal population so they
+     * overwrite a valid header field with the value the worker must
+     * reject (drives the pre-apply self-defense branches). */
+    if (scen->corrupt_abi == 1) {
+        hdr->abi_identity[PW_SHM_ABI_IDENTITY_BYTES - 1] ^= 1;
+    } else if (scen->corrupt_abi == 2) {
+        hdr->abi_magic = 7;
+    }
+    if (scen->override_step_count != 0u) {
+        hdr->step_count = scen->override_step_count;
+    }
+    if (scen->override_param_count != 0u) {
+        hdr->param_count = scen->override_param_count;
+    }
+
+    /* Submission and delivery. The submission is what a host would hash and
+     * whose byte count it writes into the header before spawn; delivery is
+     * what the pipe carries after spawn: a prefix (truncate_before), the
+     * whole, or the whole plus extra bytes (deliver_extra). policy_overflow
+     * synthesizes a buffer beyond the worker's capacity in place of its
+     * placeholder text; pad_to_bytes fills a valid policy with trailing
+     * whitespace to an exact size. */
+    const char *policy_data = scen->policy;
+    size_t policy_len = strlen(scen->policy);
+    char *big = NULL;
+    if (scen->oversize_policy) {
+        size_t n = 300u * 1024u;   /* worker caps at 256 KiB */
+        big = (char *)malloc(n);
+        if (!big) {
+            fprintf(stderr, "harness: malloc oversize policy: %s\n", strerror(errno));
+            return 1;
+        }
+        memset(big, ' ', n);
+        memcpy(big, "(version 1)\n", 12);   /* harmless prefix; never compiles */
+        policy_data = big;
+        policy_len = n;
+    }
+    if (scen->pad_to_bytes) {
+        if (scen->pad_to_bytes < policy_len) {
+            fprintf(stderr, "harness: pad_to_bytes %zu is shorter than the policy (%zu bytes)\n",
+                    scen->pad_to_bytes, policy_len);
+            return 1;
+        }
+        big = (char *)malloc(scen->pad_to_bytes);
+        if (!big) {
+            fprintf(stderr, "harness: malloc padded policy: %s\n", strerror(errno));
+            return 1;
+        }
+        memset(big, ' ', scen->pad_to_bytes);
+        memcpy(big, policy_data, policy_len);
+        policy_data = big;
+        policy_len = scen->pad_to_bytes;
+    }
+    /* The policy_nul scenario sends an allow-default source, a NUL at byte
+     * 26, then a deny-default tail: a C-string reader would compile only
+     * the prefix. The worker must refuse instead (exit 9, detail 26). */
+    static const char nul_policy[] = "(version 1)(allow default)\0(deny default)";
+    if (scen->nul_policy) {
+        policy_data = nul_policy;
+        policy_len = sizeof(nul_policy) - 1u;
+    }
+    const size_t policy_bytes_expected = policy_len;
+    size_t deliver_len = policy_len;
+    /* Truncation: only the bytes before the marker reach the pipe. The
+     * marker must follow a nonempty prefix so the worker reads something. */
+    if (scen->truncate_before) {
+        const char *cut = strstr(policy_data, scen->truncate_before);
+        if (!cut || cut == policy_data) {
+            fprintf(stderr, "harness: truncate_before marker \"%s\" must follow a nonempty prefix\n",
+                    scen->truncate_before);
+            free(big);
+            return 1;
+        }
+        deliver_len = (size_t)(cut - policy_data);
+    }
+    const size_t extra_len = scen->deliver_extra ? strlen(scen->deliver_extra) : 0u;
+    const size_t policy_bytes_written = deliver_len + extra_len;
+    /* The header's expectation is the host's half of the acknowledgement:
+     * the submission's byte count unless the scenario overrides it. */
+    hdr->policy_bytes_expected = scen->expected_override_set
+        ? scen->expected_override : (uint32_t)policy_bytes_expected;
+
+    /* The host pre-touches every page it expects the worker to write
+     * after apply, so the post-apply path never depends on lazy
+     * allocation (which a strict sandbox would block). */
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) page_size = 4096;
+    volatile unsigned char *touch = (volatile unsigned char *)base;
+    for (size_t off = 0; off < PW_SHM_REGION_BYTES; off += (size_t)page_size) {
+        touch[off] = touch[off];
+    }
+    touch[PW_SHM_REGION_BYTES - 1u] = touch[PW_SHM_REGION_BYTES - 1u];
+
+    /* prepared_unset scenario leaves this at 0 so the worker refuses. */
+    if (!scen->skip_prepared) {
+        atomic_store_explicit(&hdr->prepared, 1u, memory_order_release);
+    }
+
+    /* Ready pipe + policy pipe. Parent-side ends get FD_CLOEXEC so
+     * the addclose dance from earlier broken harness designs isn't
+     * needed. */
+    int ready_pipe[2], policy_pipe[2];
+    if (pipe(ready_pipe) != 0 || pipe(policy_pipe) != 0) {
+        fprintf(stderr, "harness: pipe: %s\n", strerror(errno));
+        return 1;
+    }
+    fcntl(ready_pipe[0], F_SETFD, FD_CLOEXEC);
+    int ready_flags = fcntl(ready_pipe[0], F_GETFL, 0);
+    if (ready_flags >= 0) {
+        fcntl(ready_pipe[0], F_SETFL, ready_flags | O_NONBLOCK);
+    }
+    fcntl(policy_pipe[1], F_SETFD, FD_CLOEXEC);
+
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, policy_pipe[0], 0);
+    posix_spawn_file_actions_adddup2(&fa, shm_fd, 3);
+    posix_spawn_file_actions_adddup2(&fa, ready_pipe[1], 4);
+
+    char step_count_str[16];
+    snprintf(step_count_str, sizeof(step_count_str), "%u", scen->step_count);
+    char proceed_budget[16];
+    snprintf(proceed_budget, sizeof(proceed_budget), "%d", scen->proceed_wait_ms ? scen->proceed_wait_ms : 60000);
+    if (scen->proceed_at_prepare) atomic_store_explicit(&hdr->proceed, 1, memory_order_release);
+    char attempt_budget[24], child_deadline[24];
+    char *worker_argv[20];
+    int worker_argc = 0;
+    worker_argv[worker_argc++] = (char *)"pw-probe-runner";
+    worker_argv[worker_argc++] = (char *)"--shm-fd";     worker_argv[worker_argc++] = (char *)"3";
+    worker_argv[worker_argc++] = (char *)"--ready-fd";   worker_argv[worker_argc++] = (char *)"4";
+    worker_argv[worker_argc++] = (char *)"--step-count"; worker_argv[worker_argc++] = step_count_str;
+    worker_argv[worker_argc++] = (char *)"--proceed-wait-ms"; worker_argv[worker_argc++] = proceed_budget;
+    if (scen->exec_attempt_budget_ms) {
+        snprintf(attempt_budget, sizeof(attempt_budget), "%ld", scen->exec_attempt_budget_ms);
+        worker_argv[worker_argc++] = (char *)"--exec-attempt-budget-ms";
+        worker_argv[worker_argc++] = attempt_budget;
+    }
+    if (scen->exec_child_deadline_ms) {
+        snprintf(child_deadline, sizeof(child_deadline), "%ld", scen->exec_child_deadline_ms);
+        worker_argv[worker_argc++] = (char *)"--exec-child-deadline-ms";
+        worker_argv[worker_argc++] = child_deadline;
+    }
+    if (strcmp(scen->name, "sigkill_fallback") == 0) {
+        worker_argv[worker_argc++] = (char *)"--post-apply-hang-ms";
+        worker_argv[worker_argc++] = (char *)"30000";
+    }
+    worker_argv[worker_argc] = NULL;
+    pid_t pid;
+    /* Record the actual launch state, then exec the worker without changing
+     * environment/FDs/PID. The fixture preserves the unread policy stdin.
+     * Its report precedes the harness envelope on stdout. */
+    char *inspected_argv[] = {
+        (char *)exec_helper, "--inspect", (char *)exec_nonce,
+        "--read-fd", (char *)exec_canary_fd, "--then-exec", (char *)worker_path,
+        "--shm-fd", "3", "--ready-fd", "4", "--step-count", step_count_str, NULL,
+    };
+    /* Descriptor-limit scenarios: the worker inherits whatever this process
+     * holds at spawn. Every harness descriptor is already open, so a soft
+     * limit of 64 leaves the worker its baseline and little more. */
+    if (scen->rlimit_soft) {
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) != 0) {
+            fprintf(stderr, "harness: getrlimit: %s\n", strerror(errno));
+            return 1;
+        }
+        rl.rlim_cur = scen->rlimit_soft;
+        if (scen->rlimit_hard) rl.rlim_max = scen->rlimit_hard;
+        if (setrlimit(RLIMIT_NOFILE, &rl) != 0) {
+            fprintf(stderr, "harness: setrlimit: %s\n", strerror(errno));
+            return 1;
+        }
+    }
+    int spawn_rc = posix_spawn(&pid, exec_helper ? exec_helper : worker_path, &fa, NULL,
+                               exec_helper ? inspected_argv : worker_argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    if (spawn_rc != 0) {
+        fprintf(stderr, "harness: posix_spawn: %s\n", strerror(spawn_rc));
+        return 1;
+    }
+    close(policy_pipe[0]);
+    close(ready_pipe[1]);
+
+    /* Deliver the prepared bytes, then close so the worker sees EOF. The two
+     * byte counts mirror the host's policy_transfer records: expected is the
+     * submission, written is what the pipe was asked to carry. */
+    if (write_all_tolerant(policy_pipe[1], policy_data, deliver_len) != 0) {
+        fprintf(stderr, "harness: write policy: %s\n", strerror(errno));
+    }
+    if (extra_len && write_all_tolerant(policy_pipe[1], scen->deliver_extra, extra_len) != 0) {
+        fprintf(stderr, "harness: write extra policy bytes: %s\n", strerror(errno));
+    }
+    free(big);
+    close(policy_pipe[1]);
+
+    /* Pre-apply ready byte. 1 s deadline; the worker's pre-apply
+     * work is bounded. */
+    uint8_t ready_byte = 0;
+    int ready_received = 0;
+    {
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 10 * 1000 * 1000 };
+        for (int i = 0; i < 100; i++) {
+            ssize_t n = read(ready_pipe[0], &ready_byte, 1);
+            if (n == 1) { ready_received = 1; break; }
+            if (n == 0) break;  /* EOF — worker exited without writing */
+            if (n < 0 && errno != EINTR && errno != EAGAIN) break;
+            nanosleep(&ts, NULL);
+        }
+    }
+    close(ready_pipe[0]);
+
+    /* Poll applied + done. Deadline 2 s (or the scenario's poll_deadline_ms)
+     * — generous for any slow compile/apply on first run after rebuild. A
+     * worker that refuses pre-apply (abi / prepared / step_count /
+     * param_count / policy overflow) exits immediately without flipping
+     * either sentinel, so we also watch for an early worker exit and capture
+     * its status here rather than polling the full deadline. */
+    int release_set = scen->proceed_at_prepare;
+    int early_completion = 0, early_attempt = 0, quiescence_polls = 0;
+    long held_ms = 0, done_after_applied_ms = -1;
+    int poll_iters = (scen->poll_deadline_ms ? scen->poll_deadline_ms : 2000) / 2;
+    struct timespec applied_time = {0};
+    pw_shm_evidence_t *order_e = (void *)((char *)base + PW_SHM_REGION_BYTES
+        - PW_SHM_DIAGNOSTIC_BYTES - PW_SHM_EVIDENCE_HEADER_BYTES);
+    int saw_applied = 0;
+    int saw_done = 0;
+    int status = 0;
+    pid_t reaped = 0;
+    int worker_reaped = 0;
+    {
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 2 * 1000 * 1000 };
+        for (int i = 0; i < poll_iters; i++) {
+            uint32_t applied = atomic_load_explicit(&hdr->applied, memory_order_acquire);
+            uint32_t done = atomic_load_explicit(&hdr->done, memory_order_acquire);
+            if (applied && !saw_applied) { saw_applied = 1; clock_gettime(CLOCK_MONOTONIC, &applied_time); }
+            if (applied && !release_set) {
+                quiescence_polls++;
+                for (uint32_t slot = 0; slot < scen->step_count; slot++) {
+                    if (atomic_load_explicit(&slots[slot].completed, memory_order_acquire)) early_completion = 1;
+                }
+                uint32_t progress = atomic_load_explicit(&order_e->progress, memory_order_acquire);
+                if ((progress >> 24) == PW_OP_ATTEMPT) early_attempt = 1;
+                struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+                long elapsed = (now.tv_sec - applied_time.tv_sec) * 1000
+                    + (now.tv_nsec - applied_time.tv_nsec) / 1000000;
+                if ((!scen->withhold_proceed && elapsed >= scen->proceed_delay_ms)
+                    || (done && scen->proceed_after_expiry && elapsed >= scen->proceed_delay_ms)) {
+                    atomic_store_explicit(&hdr->proceed, 1, memory_order_release);
+                    release_set = 1;
+                    held_ms = elapsed;
+                }
+            }
+            if (done && (!scen->proceed_after_expiry || release_set)) {
+                saw_done = 1;
+                if (saw_applied) {
+                    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+                    done_after_applied_ms = (now.tv_sec - applied_time.tv_sec) * 1000
+                        + (now.tv_nsec - applied_time.tv_nsec) / 1000000;
+                }
+                if (scen->proceed_after_expiry) usleep(50000); /* late release cannot revive */
+                break;
+            }
+            pid_t w = waitpid(pid, &status, WNOHANG);
+            if (w == pid) { worker_reaped = 1; reaped = pid; break; }
+            nanosleep(&ts, NULL);
+        }
+    }
+
+    /* A late release still cannot revive a refusal after prompt exit. */
+    if (scen->proceed_after_expiry && !release_set) {
+        usleep((useconds_t)scen->proceed_delay_ms * 1000);
+        atomic_store_explicit(&hdr->proceed, 1, memory_order_release);
+        release_set = 1;
+        if (saw_applied) {
+            struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+            held_ms = (now.tv_sec - applied_time.tv_sec) * 1000
+                + (now.tv_nsec - applied_time.tv_nsec) / 1000000;
+        } else {
+            held_ms = -1; /* application was not sampled before reap */
+        }
+    }
+
+    /* Retain cancellation as an independent host action. Terminal completion
+     * never needs this store; no-request scenarios leave the word zero. */
+    if (scen->request_exit && !worker_reaped) {
+        atomic_store_explicit(&hdr->exit_requested, 1u, memory_order_release);
+    }
+
+    /* Wait for the worker to clean-exit (unless already reaped above).
+     * 1 s deadline — if it hasn't exited by then, SIGKILL so the test
+     * doesn't hang. */
+    int sent_sigkill = 0;
+    if (!worker_reaped) {
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 10 * 1000 * 1000 };
+        for (int i = 0; i < 100; i++) {
+            reaped = waitpid(pid, &status, WNOHANG);
+            if (reaped == pid) break;
+            nanosleep(&ts, NULL);
+        }
+        if (reaped != pid) {
+            kill(pid, SIGKILL);
+            sent_sigkill = 1;
+            waitpid(pid, &status, 0);
+        }
+    }
+
+    /* Publications can land between the final poll samples and reap. */
+    int final_applied = atomic_load_explicit(&hdr->applied, memory_order_acquire) == 1;
+    int final_done = atomic_load_explicit(&hdr->done, memory_order_acquire) == 1;
+    /* A retained application flag does not supply a missing start sample. */
+    if (final_done && saw_applied && done_after_applied_ms < 0) {
+        struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+        done_after_applied_ms = (now.tv_sec - applied_time.tv_sec) * 1000
+            + (now.tv_nsec - applied_time.tv_nsec) / 1000000;
+    }
+    saw_applied = final_applied;
+    saw_done = final_done;
+
+    /* Emit result envelope. */
+    printf("{");
+    printf("\"scenario\":"); emit_json_string(stdout, scen->name);
+    printf(",\"rlimit_soft\":%u,\"rlimit_hard\":%u", scen->rlimit_soft, scen->rlimit_hard);
+    printf(",\"worker_pid\":%d", pid);
+    printf(",\"ready_byte_received\":%s", ready_received ? "true" : "false");
+    printf(",\"applied\":%s", saw_applied ? "true" : "false");
+    printf(",\"apply_rc\":%d", hdr->apply_rc);
+    printf(",\"policy_bytes_expected\":%zu,\"policy_bytes_written\":%zu",
+           policy_bytes_expected, policy_bytes_written);
+    /* The host's half (header input) and the worker's half (EOF receipt). The
+     * count is reported only behind an acquired publication flag of 1, the
+     * same gate the production host uses. */
+    printf(",\"header_bytes_expected\":%u", hdr->policy_bytes_expected);
+    {
+        uint32_t read_published = atomic_load_explicit(&hdr->policy_read_published, memory_order_acquire);
+        printf(",\"policy_read_published\":%u", read_published);
+        if (read_published == 1u) printf(",\"policy_bytes_received\":%u", hdr->policy_bytes_received);
+    }
+    printf(",\"proceed_set\":%s,\"proceed_observed\":%u", release_set ? "true" : "false",
+        atomic_load_explicit(&hdr->proceed_observed, memory_order_acquire));
+    printf(",\"early_completion\":%d,\"early_attempt\":%d,\"quiescence_polls\":%d",
+           early_completion, early_attempt, quiescence_polls);
+    printf(",\"held_ms\":%ld,\"done_after_applied_ms\":%ld", held_ms, done_after_applied_ms);
+    printf(",\"progress\":%u", atomic_load_explicit(&order_e->progress, memory_order_acquire));
+    printf(",\"done\":%s", saw_done ? "true" : "false");
+    printf(",\"sent_sigkill\":%s", sent_sigkill ? "true" : "false");
+    printf(",\"exit_requested\":%u", atomic_load_explicit(&hdr->exit_requested, memory_order_acquire));
+    if (WIFEXITED(status)) {
+        printf(",\"exit_code\":%d,\"term_signal\":null", WEXITSTATUS(status));
+    } else if (WIFSIGNALED(status)) {
+        printf(",\"exit_code\":null,\"term_signal\":%d", WTERMSIG(status));
+    } else {
+        printf(",\"exit_code\":null,\"term_signal\":null");
+    }
+    pw_shm_evidence_t *ev = (pw_shm_evidence_t *)((char *)base + PW_SHM_REGION_BYTES
+        - PW_SHM_DIAGNOSTIC_BYTES - PW_SHM_EVIDENCE_HEADER_BYTES);
+    uint32_t published = atomic_load_explicit(&ev->failure_published, memory_order_acquire);
+    printf(",\"failure_published\":%u", published);
+    if (published == 1) {
+        printf(",\"failure\":{\"operation\":%u,\"code\":%u,\"detail\":%u,\"native_kind\":%u,\"errno_present\":%u}",
+               ev->operation, ev->code, ev->detail, ev->native_kind, ev->errno_present);
+    }
+    printf(",\"slots\":[");
+    for (uint32_t i = 0; i < scen->step_count; i++) {
+        if (i) putc(',', stdout);
+        uint32_t completed = atomic_load_explicit(&slots[i].completed, memory_order_acquire);
+        printf("{");
+        printf("\"step_id\":"); emit_json_string(stdout, slots[i].step_id);
+        printf(",\"completed\":%u", completed);
+        printf(",\"rc\":%d", slots[i].rc);
+        printf(",\"errno\":%d", slots[i].errno_val);
+        printf(",\"observed_path\":"); emit_json_string(stdout, slots[i].observed_path);
+        printf(",\"error\":"); emit_json_string(stdout, slots[i].error);
+        if (slots[i].attempt_kind == PW_ATTEMPT_EXEC_SPAWN) {
+            printf(",\"child_pid\":%d,\"child_exit_code\":%d,\"child_term_signal\":%d",
+                   slots[i].child_pid, slots[i].child_exit_code, slots[i].child_term_signal);
+            printf(",\"stdout\":"); emit_json_string(stdout, slots[i].child_stdout);
+            printf(",\"stderr\":"); emit_json_string(stdout, slots[i].child_stderr);
+        }
+        printf("}");
+    }
+    printf("]");
+    /* For the file unlink/create scenarios, report whether the
+     * harness-owned target exists after the worker ran — the durable
+     * proof that the unlink removed it (or the create made it). null for
+     * scenarios that don't use a temp target. */
+    if (scen->temp_target != TEMP_NONE) {
+        int exists_after = (access(temp_path, F_OK) == 0) ? 1 : 0;
+        printf(",\"target_exists_after\":%s", exists_after ? "true" : "false");
+        unlink(temp_path);   /* best-effort cleanup */
+    } else {
+        printf(",\"target_exists_after\":null");
+    }
+    printf("}\n");
+    fflush(stdout);
+
+    munmap(base, PW_SHM_REGION_BYTES);
+    close(shm_fd);
+    return 0;
+}

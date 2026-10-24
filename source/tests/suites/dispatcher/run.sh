@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+source "${ROOT_DIR}/tests/lib/case.sh"
+
+if test_selected artifact_controls; then
+test_begin dispatcher artifact_controls
+test_step fixture "build the fixture XPC host stubs"
+export PW_DISPATCHER_HOST_FIXTURE="${PW_TEST_ARTIFACTS}/host-fixture"
+test_build_fixture "${ROOT_DIR}/tests/fixtures/dispatcher/build.sh" \
+  "${PW_DISPATCHER_HOST_FIXTURE}" "${PW_TEST_ARTIFACTS}/host-fixture-build.log"
+test_step integrity "reject damaged bundles and retain changes after passing or failing cases"
+test_check_python "${PW_TEST_ARTIFACTS}/assertions.log" "artifact controls failed" \
+  "${ROOT_DIR}/tests/suites/dispatcher/check_artifacts.py" "${PW_TEST_ARTIFACTS}"
+test_pass "app-dependent cases require a valid artifact and testing preserves the selected bundle"
+fi
+
+if test_selected controls; then
+test_begin dispatcher controls
+test_step reconcile "compare real dispatcher exits and summaries against controlled suite evidence"
+test_check_python "${PW_TEST_ARTIFACTS}/assertions.log" "dispatcher controls failed" \
+  "${ROOT_DIR}/tests/suites/dispatcher/check.py" "${PW_TEST_ARTIFACTS}"
+test_pass "requested suite exits, case reports, and lifecycle evidence determine one result"
+fi
+
+if test_selected accounting_controls; then
+test_begin dispatcher accounting_controls
+test_step accounting "check complete selection accounting and sleep records independently of reconciliation"
+test_check_python "${PW_TEST_ARTIFACTS}/assertions.log" "accounting controls failed" \
+  "${ROOT_DIR}/tests/suites/dispatcher/check_accounting.py" "${PW_TEST_ARTIFACTS}"
+test_pass "accounting preserves every selection, refuses incomplete or ambiguous results, and reports sleep without changing results"
+fi
+
+if test_selected cancellation_controls; then
+test_begin dispatcher cancellation_controls
+test_step fixture "build the fixture XPC host stubs"
+export PW_DISPATCHER_HOST_FIXTURE="${PW_TEST_ARTIFACTS}/host-fixture"
+test_build_fixture "${ROOT_DIR}/tests/fixtures/dispatcher/build.sh" \
+  "${PW_DISPATCHER_HOST_FIXTURE}" "${PW_TEST_ARTIFACTS}/host-fixture-build.log"
+test_step cancellation "observe interruption, process exits, preserved evidence, and queued work"
+test_check_python "${PW_TEST_ARTIFACTS}/assertions.log" "cancellation controls failed" \
+  "${ROOT_DIR}/tests/suites/dispatcher/check_cancellation.py" "${PW_TEST_ARTIFACTS}"
+test_pass "ordinary case cancellation stops descendants and the idle-sleep assertion and retains complete run accounting"
+fi
+
+if test_selected selection_controls; then
+test_begin dispatcher selection_controls
+test_step fixture "build the fixture XPC host stubs"
+export PW_DISPATCHER_HOST_FIXTURE="${PW_TEST_ARTIFACTS}/host-fixture"
+test_build_fixture "${ROOT_DIR}/tests/fixtures/dispatcher/build.sh" \
+  "${PW_DISPATCHER_HOST_FIXTURE}" "${PW_TEST_ARTIFACTS}/host-fixture-build.log"
+test_step command "observe selected work, configuration, and preserved evidence through the public command"
+test_check_python "${PW_TEST_ARTIFACTS}/assertions.log" "test command controls failed" \
+  "${ROOT_DIR}/tests/suites/dispatcher/check_selection.py" "${PW_TEST_ARTIFACTS}"
+test_pass "public selection, inspection, configuration, and completion match execution receipts"
+fi
+
+if test_selected retention_controls; then
+test_begin dispatcher retention_controls
+test_step retention "observe retained inventories, ownership, replacement and checkout serialization"
+test_check_python "${PW_TEST_ARTIFACTS}/assertions.log" "retention controls failed" \
+  "${ROOT_DIR}/tests/suites/dispatcher/check_retention.py" "${PW_TEST_ARTIFACTS}"
+test_pass "retained evidence and incomplete runs survive output replacement"
+fi

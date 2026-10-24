@@ -1,0 +1,841 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+PW_APP_DIR="${PW_APP_DIR:-${ROOT_DIR}/dist/PolicyWitness.app}"
+source "${ROOT_DIR}/tests/lib/case.sh"
+
+PW_TEST_SUITE="runner_c_worker_harness"
+ABI_DIR="${ROOT_DIR}/controller/tools/pw_probe_runner"
+
+# pw-probe-runner lives bundle-locally inside each XPC service.
+WORKER_PATH="${PW_APP_DIR}/Contents/XPCServices/PWRunner.xpc/Contents/MacOS/pw-probe-runner"
+
+# Compile the harness once for the whole suite. xcrun won't have a
+# build dir; drop it under tests/out so it's reproducible and
+# rebuilt on schema changes.
+HARNESS_BIN="${PW_TEST_OUT_DIR}/harness.runner_c_worker"
+mkdir -p "$(dirname "${HARNESS_BIN}")"
+harness_built=0
+
+check_prereqs() {
+  if [[ ! -x "${WORKER_PATH}" ]]; then
+    return 1
+  fi
+  if [[ ! -f "${ABI_DIR}/pw_probe_runner_abi.h" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+ensure_harness() {
+  if [[ "${harness_built}" -eq 0 ]]; then
+    test_build_fixture "${ROOT_DIR}/tests/fixtures/worker_harness/build.sh" "${HARNESS_BIN}"
+    harness_built=1
+  fi
+}
+
+# Begin the case, run one harness scenario, and leave its JSON at RESULT_FILE.
+# Returns non-zero (after test_skip) when prereqs are missing so the
+# caller can `|| return 0`; calls test_fail (which exits) if the harness
+# itself errors.
+run_harness_case() {
+  local test_id="$1" scenario="$2" desc="$3"
+  test_selected "${test_id}" || return 1
+  test_begin "${PW_TEST_SUITE}" "${test_id}"
+  test_step "harness" "${desc}"
+  if ! check_prereqs; then
+    test_skip "missing dist/PolicyWitness.app or pw_probe_runner_abi.h — run ./build.sh first" "{}"
+    return 1
+  fi
+  ensure_harness
+  RESULT_FILE="${PW_TEST_ARTIFACTS}/result.json"
+  if "${HARNESS_BIN}" "${WORKER_PATH}" "${scenario}" >"${RESULT_FILE}" 2>"${PW_TEST_ARTIFACTS}/harness.stderr"; then
+    return 0
+  else
+    local rc=$?
+    test_fail "harness exited rc=${rc}" "{\"stderr\":\"${PW_TEST_ARTIFACTS}/harness.stderr\"}"
+  fi
+}
+
+# Turn a python assertion exit code into a pass/fail. The python block is
+# expected to print a one-line ok message on success (used as the pass note).
+finish_from_assert_log() {
+  local arc="$1"
+  if [[ "${arc}" -ne 0 ]]; then
+    local msg
+    msg="$(head -5 "${PW_TEST_ARTIFACTS}/assert.log" | tr '\n' ' ' | sed 's/"/\\"/g')"
+    test_fail "${msg}" "{\"log\":\"${PW_TEST_ARTIFACTS}/assert.log\",\"result\":\"${RESULT_FILE}\"}"
+  fi
+  test_pass "$(tail -1 "${PW_TEST_ARTIFACTS}/assert.log")" "{\"result\":\"${RESULT_FILE}\"}"
+}
+
+# Uniform assertion for the pre-apply self-defense scenarios: the worker
+# must exit with a specific code, having flipped no sentinels and written
+# no ready byte.
+run_refusal_case() {
+  local test_id="$1" scenario="$2" expect_code="$3" desc="$4"
+  run_harness_case "${test_id}" "${scenario}" "${desc}" || return 0
+  set +e
+  PW_EXPECT_CODE="${expect_code}" "${PW_PYTHON}" -B -S -P - "${RESULT_FILE}" "${HARNESS_BIN}" "${WORKER_PATH}" >"${PW_TEST_ARTIFACTS}/assert.log" 2>&1 <<'PY'
+import json, os, subprocess, sys
+from pathlib import Path
+r = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+want = int(os.environ["PW_EXPECT_CODE"])
+assert r["exit_code"] == want, \
+    f"expected worker exit_code={want}, got exit_code={r['exit_code']!r} term_signal={r['term_signal']!r}"
+assert r["term_signal"] is None, f"worker should exit with a code, not a signal: {r}"
+assert not r["applied"], f"applied must stay false on a pre-apply refusal: {r}"
+assert not r["done"], f"done must stay false on a pre-apply refusal: {r}"
+assert not r["ready_byte_received"], f"ready byte must not precede a pre-apply refusal: {r}"
+assert not r["sent_sigkill"], f"worker should self-exit; no SIGKILL fallback expected: {r}"
+if r['scenario'] == 'abi_mismatch':
+    assert r['failure_published'] == 0 and all(s['completed'] == 0 for s in r['slots']), r
+    # Correct full identity plus an ordinal-era prefix must also fail before
+    # any policy application, attempt or shared evidence publication.
+    probe = subprocess.run([sys.argv[2], sys.argv[3], 'abi_magic_mismatch'],
+                           capture_output=True, text=True, timeout=10)
+    Path(sys.argv[1]).with_name('magic-mismatch.json').write_text(probe.stdout)
+    Path(sys.argv[1]).with_name('magic-mismatch.stderr').write_text(probe.stderr)
+    assert probe.returncode == 0, probe.stderr
+    old = json.loads(probe.stdout)
+    assert old['exit_code'] == 4 and old['term_signal'] is None, old
+    assert not any(old[k] for k in ('ready_byte_received', 'applied', 'done', 'sent_sigkill', 'failure_published')), old
+    assert all(s['completed'] == 0 for s in old['slots']), old
+def failure(operation, code, detail):
+    assert r['failure_published'] == 1, r
+    assert r['failure'] == {'operation': operation, 'code': code, 'detail': detail,
+                            'native_kind': 0, 'errno_present': 0}, r
+def receipt(received):
+    # The worker's EOF receipt: published exactly when the read reached EOF,
+    # and the count is reported only behind the publication flag.
+    if received is None:
+        assert r['policy_read_published'] == 0 and 'policy_bytes_received' not in r, \
+            f"no EOF receipt may be published when the read did not reach EOF: {r}"
+    else:
+        assert r['policy_read_published'] == 1 and r['policy_bytes_received'] == received, \
+            f"EOF receipt must report the {received} bytes read: {r}"
+if r['scenario'] == 'policy_overflow':
+    # Read overflow stops before EOF: capacity code 2 and no receipt, with the
+    # expectation pinned at the capacity so the header refusal does not preempt it.
+    failure(2, 2, 262143); receipt(None)
+    assert r['header_bytes_expected'] == 262143 and r['policy_bytes_written'] > 262143, r
+if r['scenario'] == 'policy_capacity_plus_one':
+    # One byte past the capacity with the expectation at the capacity: the same
+    # overflow refusal, before any length comparison.
+    failure(2, 2, 262143); receipt(None)
+    assert r['header_bytes_expected'] == 262143 and r['policy_bytes_written'] == 262144, r
+if r['scenario'] == 'policy_nul':
+    # Equal counts pass the length check; the NUL guard then refuses. The
+    # receipt records the completed read of all 41 bytes.
+    failure(2, 9, 26); receipt(41)
+    assert r['header_bytes_expected'] == 41 == r['policy_bytes_written'], r
+if r['scenario'] == 'policy_expectation_out_of_range':
+    # An expectation the buffer cannot hold is invalid host input, refused on
+    # the header operation before any policy byte is consumed: no receipt.
+    failure(1, 12, 262144); receipt(None)
+    assert r['header_bytes_expected'] == 262144, r
+if r['scenario'] == 'policy_overdelivered':
+    # The other direction of the comparison: more bytes than the submission.
+    failure(2, 13, 43); receipt(43)
+    assert r['header_bytes_expected'] == 28 == r['policy_bytes_expected'] and r['policy_bytes_written'] == 43, r
+if r['scenario'] == 'policy_empty_short':
+    # Empty EOF against a nonzero expectation: a length refusal naming zero.
+    failure(2, 13, 0); receipt(0)
+    assert r['header_bytes_expected'] == 43 and r['policy_bytes_written'] == 0, r
+if r['scenario'] == 'policy_zero_expected':
+    # Nonempty input against a zero expectation: zero is compared, not treated as unset.
+    failure(2, 13, 28); receipt(28)
+    assert r['header_bytes_expected'] == 0 and r['policy_bytes_written'] == 28, r
+print(f"ok: worker refused with exit_code={want}; no ready/applied/done")
+PY
+  local arc=$?
+  set -e
+  finish_from_assert_log "${arc}"
+}
+
+# ---- test_id: happy_default_allow ----------------------------------------
+
+run_happy_default_allow() {
+  run_harness_case "happy_default_allow" "happy_default_allow" \
+    "pw-probe-runner under (allow default): read /etc/hosts succeeds, sentinels fire, clean exit" || return 0
+  set +e
+  "${PW_PYTHON}" -B -S -P - "${RESULT_FILE}" >"${PW_TEST_ARTIFACTS}/assert.log" 2>&1 <<'PY'
+import json, sys
+from pathlib import Path
+r = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+
+assert r["ready_byte_received"], "pre-apply ready byte not received"
+assert r["applied"], f"applied sentinel never flipped: {r}"
+assert r["apply_rc"] == 0, f"sandbox_apply returned {r['apply_rc']}"
+assert r["done"], f"done sentinel never flipped: {r}"
+assert not r["sent_sigkill"], "harness had to SIGKILL the worker after terminal publication"
+assert r["exit_code"] == 0, f"worker exit_code != 0: {r}"
+assert r["term_signal"] is None, f"worker was signaled: {r}"
+
+slots = r["slots"]
+assert len(slots) == 1, f"expected 1 slot, got {len(slots)}"
+s = slots[0]
+assert s["completed"] == 1, f"slot not marked completed: {s}"
+assert s["rc"] == 0, f"file open_read /etc/hosts under (allow default) should succeed: {s}"
+assert s["observed_path"] == "/private/etc/hosts", \
+    f"observed_path should be the F_GETPATH-canonical form: {s['observed_path']!r}"
+assert r["policy_read_published"] == 1 and \
+    r["policy_bytes_received"] == r["policy_bytes_expected"] == r["header_bytes_expected"] == r["policy_bytes_written"], \
+    f"a complete delivery must report equal expectation and receipt: {r}"
+
+print(f"ok: ready+applied+done+clean_exit; /etc/hosts opened (observed={s['observed_path']})")
+PY
+  local arc=$?
+  set -e
+  finish_from_assert_log "${arc}"
+}
+
+# ---- test_id: bare_deny_default ------------------------------------------
+
+run_bare_deny_default() {
+  run_harness_case "bare_deny_default" "bare_deny_default" \
+    "pw-probe-runner under bare (deny default): worker still completes; slot reports kernel deny" || return 0
+  set +e
+  "${PW_PYTHON}" -B -S -P - "${RESULT_FILE}" >"${PW_TEST_ARTIFACTS}/assert.log" 2>&1 <<'PY'
+import json, sys
+from pathlib import Path
+r = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+
+# This scenario is the downstream bug-report shape. The PRE-Step-5
+# Swift worker died here without producing step results. The C
+# worker must survive: sentinels fire, the slot reports the kernel
+# deny, and the worker exits cleanly.
+assert r["ready_byte_received"], "pre-apply ready byte not received under (deny default)"
+assert r["applied"], f"applied sentinel never flipped — worker died pre-apply? {r}"
+assert r["apply_rc"] == 0, f"sandbox_apply returned {r['apply_rc']}"
+assert r["exit_requested"] == 0, r
+assert r["done"], f"done sentinel never flipped — this is the bug-report regression: {r}"
+assert not r["sent_sigkill"], "harness had to SIGKILL the worker after terminal publication under (deny default)"
+assert r["exit_code"] == 0, f"worker exit_code != 0: {r}"
+
+slots = r["slots"]
+assert len(slots) == 1
+s = slots[0]
+assert s["completed"] == 1, f"slot not marked completed under (deny default): {s}"
+# The kernel denies the open; rc=1, errno is EACCES (13) or EPERM (1).
+# We accept either to avoid pinning a specific kernel revision.
+assert s["rc"] == 1, f"file open_read /etc/hosts under (deny default) should be denied: {s}"
+assert s["errno"] in (1, 13), \
+    f"expected errno EPERM (1) or EACCES (13) for the kernel deny, got {s['errno']}"
+
+print(f"ok: worker survived (deny default); slot reports kernel deny errno={s['errno']}")
+PY
+  local arc=$?
+  set -e
+  finish_from_assert_log "${arc}"
+}
+
+# ---- test_id: terminal_exit_without_request --------------------------------------------
+
+run_terminal_exit_without_request() {
+  run_harness_case "terminal_exit_without_request" "terminal_exit_without_request" \
+    "worker publishes done and independently exits with exit_requested left zero" || return 0
+  set +e
+  "${PW_PYTHON}" -B -S -P - "${RESULT_FILE}" "${HARNESS_BIN}" "${WORKER_PATH}" >"${PW_TEST_ARTIFACTS}/assert.log" 2>&1 <<'PY'
+import json, subprocess, sys
+from pathlib import Path
+r = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+
+# The host never grants exit permission; the published mapping survives reap.
+assert r["done"] and r["exit_requested"] == 0, r
+assert not r["sent_sigkill"], "terminal worker required a cleanup kill"
+assert r["exit_code"] == 0, f"worker did not _exit(0): {r}"
+assert r["term_signal"] is None, f"worker was signaled instead of _exit'ing: {r}"
+probe = subprocess.run([sys.argv[2], sys.argv[3], 'terminal_empty_phase'], capture_output=True, text=True, timeout=10)
+Path(sys.argv[1]).with_name('empty-phase.json').write_text(probe.stdout)
+Path(sys.argv[1]).with_name('empty-phase.stderr').write_text(probe.stderr)
+assert probe.returncode == 0, probe.stderr
+empty = json.loads(probe.stdout)
+assert empty['done'] and empty['exit_code'] == 0 and empty['term_signal'] is None, empty
+assert empty['exit_requested'] == 0 and not empty['sent_sigkill'] and empty['slots'] == [], empty
+print("ok: worker published done and exited without an exit request or cleanup kill")
+PY
+  local arc=$?
+  set -e
+  finish_from_assert_log "${arc}"
+}
+
+# ---- test_id: max_slots_deny_default ---------------------------------------
+
+run_max_slots_deny_default() {
+  run_harness_case "max_slots_deny_default" "max_slots_deny_default" \
+    "worker completes all 256 shared-memory slots under bare (deny default)" || return 0
+  set +e
+  "${PW_PYTHON}" -B -S -P - "${RESULT_FILE}" >"${PW_TEST_ARTIFACTS}/assert.log" 2>&1 <<'PY'
+import json, sys
+from pathlib import Path
+r = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+
+assert r["ready_byte_received"], "pre-apply ready byte not received"
+assert r["applied"], f"applied sentinel never flipped: {r}"
+assert r["apply_rc"] == 0, f"sandbox_apply returned {r['apply_rc']}"
+assert r["done"], f"done sentinel never flipped: {r}"
+assert not r["sent_sigkill"], "worker did not clean-exit after max-slot run"
+assert r["exit_code"] == 0, f"worker exit_code != 0: {r}"
+
+slots = r["slots"]
+assert len(slots) == 256, f"expected 256 slots, got {len(slots)}"
+for idx in (0, 1, 2, 127, 255):
+    s = slots[idx]
+    assert s["step_id"] == f"none_{idx:03d}", f"slot {idx} step_id mismatch: {s}"
+    assert s["completed"] == 1, f"slot {idx} not completed: {s}"
+    assert s["rc"] == 0, f"PW_ATTEMPT_NONE slot {idx} should rc=0: {s}"
+    assert s["errno"] == 0, f"PW_ATTEMPT_NONE slot {idx} should errno=0: {s}"
+
+missing = [i for i, s in enumerate(slots) if s["completed"] != 1]
+assert not missing, f"incomplete slots: {missing[:10]}"
+print("ok: 256 slots completed across the full shared-memory region under deny-default")
+PY
+  local arc=$?
+  set -e
+  finish_from_assert_log "${arc}"
+}
+
+# ---- test_id: sigkill_fallback ---------------------------------------------
+
+run_sigkill_fallback() {
+  run_harness_case "sigkill_fallback" "sigkill_fallback" \
+    "host SIGKILL fallback reaps a worker stalled before done" || return 0
+  set +e
+  "${PW_PYTHON}" -B -S -P - "${RESULT_FILE}" >"${PW_TEST_ARTIFACTS}/assert.log" 2>&1 <<'PY'
+import json, sys
+from pathlib import Path
+r = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+
+assert r["ready_byte_received"], "pre-apply ready byte not received"
+assert r["applied"], f"applied sentinel never flipped: {r}"
+assert not r["done"], f"controlled stall must precede done: {r}"
+assert r["sent_sigkill"], f"expected harness SIGKILL fallback, got clean exit: {r}"
+assert r["exit_code"] is None, f"worker should not have clean-exited: {r}"
+assert r["term_signal"] == 9, f"expected SIGKILL term_signal=9: {r}"
+
+slots = r["slots"]
+assert len(slots) == 1, f"expected 1 slot, got {len(slots)}"
+assert slots[0]["completed"] == 1, f"slot should complete before fallback kill: {slots[0]}"
+print("ok: host SIGKILL fallback reaped worker from the controlled pre-done stall")
+PY
+  local arc=$?
+  set -e
+  finish_from_assert_log "${arc}"
+}
+
+# ---- test_id: params_round_trip --------------------------------------------
+
+run_params_round_trip() {
+  run_harness_case "params_round_trip" "params_round_trip" \
+    "policy.params reach the kernel: (subpath (param \"TARGET\")) denies /etc/hosts when TARGET=/private/etc" || return 0
+  set +e
+  "${PW_PYTHON}" -B -S -P - "${RESULT_FILE}" >"${PW_TEST_ARTIFACTS}/assert.log" 2>&1 <<'PY'
+import json, sys
+from pathlib import Path
+r = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+
+# Three distinguishable outcomes:
+#   (a) compile failed: sandbox_compile_string couldn't resolve
+#       (param "TARGET") so apply_rc=-1, done is set, no slots ran.
+#       Means the worker built a params object but it was empty or
+#       the SET failed silently.
+#   (b) compile + apply succeeded but slot rc=0: the param was
+#       parsed but its value didn't reach the compiled profile,
+#       so the kernel allowed /etc/hosts.
+#   (c) compile + apply succeeded AND slot rc=1 with errno=EPERM:
+#       the param TARGET=/private/etc reached the compiled profile,
+#       the kernel saw the deny rule, and the open was denied.
+#
+# (c) is the only outcome that proves end-to-end round-trip.
+#
+# SBPL subpath matches the kernel-canonical path, NOT user-visible
+# aliases — /etc realpaths to /private/etc on macOS, so TARGET must
+# be /private/etc for the deny rule to fire on a /etc/hosts open.
+# This is a SBPL semantic detail, not a worker concern; both the C
+# harness (harness.c::populate_params_target) and this assertion text
+# document it so a future debugger doesn't waste time on /etc.
+assert r["ready_byte_received"], "pre-apply ready byte not received"
+assert r["apply_rc"] == 0, \
+    f"sandbox_compile_string + apply failed (apply_rc={r['apply_rc']}); params didn't construct the profile"
+assert r["applied"], f"applied sentinel never flipped: {r}"
+assert r["done"], f"done sentinel never flipped: {r}"
+assert not r["sent_sigkill"], "worker did not clean-exit"
+assert r["exit_code"] == 0, f"worker exit_code != 0: {r}"
+
+slots = r["slots"]
+assert len(slots) == 1, f"expected 1 slot, got {len(slots)}"
+s = slots[0]
+assert s["completed"] == 1, f"slot not marked completed: {s}"
+assert s["rc"] == 1, \
+    f"TARGET=/private/etc should make /etc/hosts open fail with EPERM; got rc={s['rc']} errno={s['errno']}. " \
+    f"This means the param didn't reach the kernel — likely a worker bug in the sandbox_set_param path."
+assert s["errno"] in (1, 13), \
+    f"expected errno EPERM (1) or EACCES (13) for the param-driven kernel deny, got {s['errno']}"
+
+print(f"ok: TARGET=/private/etc round-tripped; kernel denied /etc/hosts with errno={s['errno']}")
+PY
+  local arc=$?
+  set -e
+  finish_from_assert_log "${arc}"
+}
+
+# ---- test_id: unlink_allow / unlink_deny (PW_ATTEMPT_FILE_UNLINK) ----------
+
+run_unlink_allow() {
+  run_harness_case "unlink_allow" "unlink_allow" \
+    "file unlink under (allow default): worker removes the harness temp file" || return 0
+  set +e
+  "${PW_PYTHON}" -B -S -P - "${RESULT_FILE}" >"${PW_TEST_ARTIFACTS}/assert.log" 2>&1 <<'PY'
+import json, sys
+from pathlib import Path
+r = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert r["applied"] and r["done"] and r["exit_code"] == 0, f"worker did not complete cleanly: {r}"
+s = r["slots"][0]
+assert s["completed"] == 1, f"slot not completed: {s}"
+assert s["rc"] == 0, f"unlink under (allow default) should succeed: {s}"
+assert r["target_exists_after"] is False, f"target should be gone after a successful unlink: {r}"
+print("ok: unlink removed the target under (allow default)")
+PY
+  local arc=$?
+  set -e
+  finish_from_assert_log "${arc}"
+}
+
+run_unlink_deny() {
+  run_harness_case "unlink_deny" "unlink_deny" \
+    "file unlink under (deny default): worker is denied; target survives" || return 0
+  set +e
+  "${PW_PYTHON}" -B -S -P - "${RESULT_FILE}" >"${PW_TEST_ARTIFACTS}/assert.log" 2>&1 <<'PY'
+import json, sys
+from pathlib import Path
+r = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert r["applied"] and r["done"] and r["exit_code"] == 0, f"worker did not complete cleanly: {r}"
+s = r["slots"][0]
+assert s["completed"] == 1, f"slot not completed: {s}"
+assert s["rc"] == 1, f"unlink under (deny default) should be denied (rc=1): {s}"
+assert s["errno"] in (1, 13), f"expected EPERM(1)/EACCES(13) on the kernel deny, got errno={s['errno']}: {s}"
+assert r["target_exists_after"] is True, f"target must survive a denied unlink: {r}"
+print(f"ok: unlink denied (errno={s['errno']}); target survived under (deny default)")
+PY
+  local arc=$?
+  set -e
+  finish_from_assert_log "${arc}"
+}
+
+# ---- test_id: create_allow (PW_ATTEMPT_FILE_CREATE) ------------------------
+
+run_create_allow() {
+  run_harness_case "create_allow" "create_allow" \
+    "file create under (allow default): worker creates the (absent) target" || return 0
+  set +e
+  "${PW_PYTHON}" -B -S -P - "${RESULT_FILE}" >"${PW_TEST_ARTIFACTS}/assert.log" 2>&1 <<'PY'
+import json, sys
+from pathlib import Path
+r = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert r["applied"] and r["done"] and r["exit_code"] == 0, f"worker did not complete cleanly: {r}"
+s = r["slots"][0]
+assert s["completed"] == 1, f"slot not completed: {s}"
+assert s["rc"] == 0, f"create under (allow default) should succeed: {s}"
+# F_GETPATH canonicalizes the fd while it is open; the create path should
+# resolve under /private/... (or wherever TMPDIR points), not be empty.
+assert s["observed_path"], f"create should capture observed_path from the open fd: {s}"
+assert r["target_exists_after"] is True, f"target must exist after a successful create: {r}"
+print(f"ok: create made the target (observed_path={s['observed_path']})")
+PY
+  local arc=$?
+  set -e
+  finish_from_assert_log "${arc}"
+}
+
+# ---- test_id: compile_failure (worker survives malformed SBPL) -------------
+
+run_compile_failure() {
+  run_harness_case "compile_failure" "compile_failure" \
+    "malformed SBPL: apply_rc=-1, done flips, applied stays 0, worker still clean-exits" || return 0
+  set +e
+  "${PW_PYTHON}" -B -S -P - "${RESULT_FILE}" >"${PW_TEST_ARTIFACTS}/assert.log" 2>&1 <<'PY'
+import json, sys
+from pathlib import Path
+r = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+# The compile fails before the ready byte and before apply, so:
+assert r["ready_byte_received"] is False, f"compile fails before the ready byte: {r}"
+assert r["applied"] is False, f"applied must stay false when compile fails: {r}"
+assert r["apply_rc"] == -1, f"apply_rc must be -1 on compile failure (got {r['apply_rc']}): {r}"
+# ...but the worker still publishes done and exits cleanly.
+assert r["done"] is True, f"done must flip so the host stops polling: {r}"
+assert r["sent_sigkill"] is False, f"worker should exit after terminal publication without SIGKILL: {r}"
+assert r["exit_code"] == 0, f"worker should _exit(0) after reporting the compile failure: {r}"
+# No attempts ran.
+assert r["slots"][0]["completed"] == 0, f"no slot should run when compile fails: {r['slots'][0]}"
+print("ok: worker reported compile failure (apply_rc=-1, done) and clean-exited")
+PY
+  local arc=$?
+  set -e
+  finish_from_assert_log "${arc}"
+}
+
+run_happy_default_allow
+run_bare_deny_default
+run_terminal_exit_without_request
+run_max_slots_deny_default
+run_sigkill_fallback
+run_params_round_trip
+
+# File unlink and creation of an absent target through the worker ABI.
+run_unlink_allow
+run_unlink_deny
+run_create_allow
+
+# #2 — pre-apply self-defense / refusal branches.
+run_compile_failure
+run_refusal_case "abi_mismatch_refused"        "abi_mismatch"        4 \
+  "header ABI identity differs from worker build → exit 4, no apply"
+run_refusal_case "prepared_unset_refused"      "prepared_unset"      5 \
+  "host did not set prepared=1 → exit 5, no apply"
+run_refusal_case "step_count_overflow_refused" "step_count_overflow" 6 \
+  "header step_count > PW_SHM_MAX_STEPS → exit 6"
+run_refusal_case "policy_overflow_refused"     "policy_overflow"     7 \
+  "policy exceeds the 256 KiB cap → exit 7"
+run_refusal_case "policy_nul_refused"          "policy_nul"          9 \
+  "policy carries an embedded NUL → exit 9, no prefix compiled"
+run_refusal_case "param_count_overflow_refused" "param_count_overflow" 8 \
+  "header param_count > PW_SHM_MAX_PARAMS → exit 8"
+run_refusal_case "policy_expectation_out_of_range_refused" "policy_expectation_out_of_range" 10 \
+  "header policy_bytes_expected = PW_SHM_POLICY_BYTES cannot fit the buffer → exit 10 before any read"
+run_refusal_case "policy_capacity_plus_one_refused" "policy_capacity_plus_one" 7 \
+  "one byte past the source capacity with the expectation at the capacity → read overflow, exit 7, no receipt"
+run_refusal_case "policy_overdelivered_refused" "policy_overdelivered" 11 \
+  "pipe carries the submission plus a (deny default) tail → length refusal names 43 received, exit 11"
+run_refusal_case "policy_empty_short_refused" "policy_empty_short" 11 \
+  "empty EOF against an expectation of 43 → length refusal names 0 received, exit 11"
+run_refusal_case "policy_zero_expected_refused" "policy_zero_expected" 11 \
+  "28 bytes against an expectation of 0 → length refusal names 28 received, exit 11"
+
+# ---- test_id: policy_truncated_prefix (transport truncation) ----------------
+# The policy pipe carries no framing. A submission cut after a complete form
+# arrives as a shorter, valid policy followed by EOF; the header's expected
+# length is what lets the worker tell it apart from a complete 28-byte
+# submission. The contract is the one the NUL refusal states for a single
+# byte: the worker must not compile and apply a prefix of the source the
+# reply's policy_sha256 describes. It publishes the 28-byte EOF receipt, then
+# refuses with code 13 naming that count, before readiness, application or any
+# attempt. policy_whole_submission below delivers the same 43 bytes intact and
+# the kernel denies the /etc/hosts open, which discriminates the policies.
+
+run_policy_truncated_prefix() {
+  run_harness_case "policy_truncated_prefix" "policy_truncated_prefix" \
+    "policy cut after (allow default), before its (deny default) tail: the worker must refuse the prefix" || return 0
+  set +e
+  "${PW_PYTHON}" -B -S -P - "${RESULT_FILE}" >"${PW_TEST_ARTIFACTS}/assert.log" 2>&1 <<'PY'
+import json, sys
+from pathlib import Path
+r = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected, written = r["policy_bytes_expected"], r["policy_bytes_written"]
+assert 0 < written < expected, f"the scenario must deliver a strict prefix; wrote {written} of {expected}: {r}"
+s = r["slots"][0]
+# The worker's account of the prefix, printed before the contract so a failure names it.
+account = (f"delivered {written} of {expected} policy bytes; ready_byte_received={r['ready_byte_received']} "
+           f"applied={r['applied']} apply_rc={r['apply_rc']} done={r['done']} exit_code={r['exit_code']} "
+           f"term_signal={r['term_signal']} failure_published={r['failure_published']} "
+           f"slot completed={s['completed']} rc={s['rc']} errno={s['errno']}")
+print(account)
+# Contract: a short read is a policy-read refusal before compile, like NUL and overflow.
+assert r["failure_published"] == 1 and r["failure"]["operation"] == 2, \
+    f"a truncated policy must publish a policy-read failure, not compile the prefix: {account}"
+assert r["failure"] == {"operation": 2, "code": 13, "detail": written, "native_kind": 0, "errno_present": 0}, \
+    f"the length refusal must name the {written} received bytes: {r['failure']}"
+assert r["header_bytes_expected"] == expected == 43 and written == 28, \
+    f"the header must carry the whole submission's count: {account}"
+assert r["policy_read_published"] == 1 and r["policy_bytes_received"] == written, \
+    f"the EOF receipt must report the {written} bytes read before the refusal: {r}"
+assert not r["ready_byte_received"] and not r["applied"] and not r["done"], \
+    f"no readiness, application or completion may follow a truncated policy: {account}"
+assert s["completed"] == 0, f"no attempt may run under a prefix policy: {account}"
+assert r["exit_code"] == 11 and r["term_signal"] is None, \
+    f"the worker must self-exit with the length refusal code: {account}"
+print(f"ok: worker refused a {written}-of-{expected}-byte policy prefix before compile (code 13, exit 11)")
+PY
+  local arc=$?
+  set -e
+  finish_from_assert_log "${arc}"
+}
+
+run_policy_truncated_prefix
+
+# ---- policy delivery controls (accepted deliveries) --------------------------
+# Each delivers a complete submission whose count equals the header's
+# expectation and asserts the EOF receipt beside the ordinary outcome: the whole
+# 43-byte submission the truncated case cut (the kernel denies /etc/hosts), a
+# multibyte UTF-8 source counted in bytes, a source padded to exactly the buffer
+# capacity, and an admitted empty source whose zero expectation passes the
+# length check and reaches ordinary compilation handling.
+
+run_policy_delivery_control() {
+  local test_id="$1" scenario="$2" desc="$3"
+  run_harness_case "${test_id}" "${scenario}" "${desc}" || return 0
+  set +e
+  "${PW_PYTHON}" -B -S -P - "${RESULT_FILE}" >"${PW_TEST_ARTIFACTS}/assert.log" 2>&1 <<'PY'
+import json, sys
+from pathlib import Path
+r = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected, written, header = r["policy_bytes_expected"], r["policy_bytes_written"], r["header_bytes_expected"]
+assert expected == written == header, f"a complete delivery must carry its own count: {r}"
+assert r["policy_read_published"] == 1 and r["policy_bytes_received"] == expected, \
+    f"the EOF receipt must equal the submission's count on a complete delivery: {r}"
+assert r["exit_code"] == 0 and r["term_signal"] is None and not r["sent_sigkill"], \
+    f"the worker must exit cleanly after terminal publication: {r}"
+assert not (r["failure_published"] == 1 and r["failure"]["operation"] == 2), \
+    f"no policy-read refusal may follow equal counts: {r}"
+s = r["slots"][0]
+if r["scenario"] == "policy_whole_submission":
+    assert expected == 43, r
+    assert r["ready_byte_received"] and r["applied"] and r["apply_rc"] == 0 and r["done"], r
+    assert s["completed"] == 1 and s["rc"] == 1 and s["errno"] in (1, 13), \
+        f"the submitted whole must deny the /etc/hosts open the prefix allowed: {s}"
+    note = f"whole 43-byte submission applied; /etc/hosts denied (errno={s['errno']})"
+elif r["scenario"] == "policy_utf8_bytes":
+    assert expected == 40, f"the receipt counts bytes, not characters: {r}"
+    assert r["applied"] and r["apply_rc"] == 0 and r["done"] and s["completed"] == 1 and s["rc"] == 0, r
+    note = "multibyte source counted in bytes (40 for 37 characters); applied and read allowed"
+elif r["scenario"] == "policy_at_capacity":
+    assert expected == 262143, r
+    assert r["applied"] and r["apply_rc"] == 0 and r["done"] and s["completed"] == 1 and s["rc"] == 0, r
+    note = "source filling the buffer exactly accepted after EOF; applied"
+elif r["scenario"] == "policy_empty_expected":
+    assert expected == 0, r
+    # Zero is compared, not treated as unset: the empty source passes the length
+    # check and reaches compilation, which libsandbox refuses on its own terms.
+    assert not r["ready_byte_received"] and not r["applied"] and r["done"] and r["apply_rc"] == -1, r
+    assert r["failure_published"] == 1 and r["failure"]["operation"] == 5, \
+        f"an empty source reaches compilation, not a length refusal: {r}"
+    assert s["completed"] == 0, s
+    note = "zero expectation with empty EOF passed the length check; compilation refused the empty source"
+else:
+    raise AssertionError(f"unknown delivery control {r['scenario']}")
+print(f"ok: receipt {r['policy_bytes_received']} of {expected} bytes; {note}")
+PY
+  local arc=$?
+  set -e
+  finish_from_assert_log "${arc}"
+}
+
+run_policy_delivery_control "policy_whole_submission" "policy_whole_submission" \
+  "the whole 43-byte submission the truncated case cut: applied, /etc/hosts denied, receipt 43 of 43"
+run_policy_delivery_control "policy_utf8_bytes" "policy_utf8_bytes" \
+  "a source with multibyte UTF-8: expectation and receipt count bytes (40), applied"
+run_policy_delivery_control "policy_at_capacity" "policy_at_capacity" \
+  "a source padded to exactly PW_SHM_POLICY_BYTES - 1 bytes is accepted after EOF and applied"
+run_policy_delivery_control "policy_empty_expected" "policy_empty_expected" \
+  "an empty source with a zero expectation passes the length check and reaches compilation"
+
+# ---- test_id: exec_pipes_per_attempt ---------------------------------------
+# Exec pipes and spawn handles exist only inside the attempt, after apply.
+# A hard descriptor ceiling of 64 cannot hold 32 pre-opened pipe pairs, so
+# 32 clean spawns around a system import and surrounding reads prove that no
+# exec step holds descriptors across another step's work.
+
+run_exec_pipes_per_attempt() {
+  run_harness_case "exec_pipes_per_attempt" "exec_pipes_per_attempt" \
+    "32 exec slots plus a system import and surrounding reads under a 64-descriptor hard ceiling" || return 0
+  set +e
+  "${PW_PYTHON}" -B -S -P - "${RESULT_FILE}" >"${PW_TEST_ARTIFACTS}/assert.log" 2>&1 <<'PY'
+import json, sys
+from pathlib import Path
+r = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert r["rlimit_soft"] == 64 and r["rlimit_hard"] == 64, r
+assert r["ready_byte_received"] and r["applied"] and r["apply_rc"] == 0 and r["done"], r
+assert not r["sent_sigkill"] and r["exit_code"] == 0 and r["term_signal"] is None, r
+assert r["failure_published"] == 0, r
+all_slots = r["slots"]
+assert all(s["completed"] == 1 for s in all_slots), all_slots
+execs = [s for s in all_slots if "child_pid" in s]
+reads = [s for s in all_slots if "child_pid" not in s]
+assert [s["step_id"] for s in reads] == ["read_etc_hosts", "read_after_exec"], reads
+assert all(s["rc"] == 0 and s["errno"] == 0 and s["observed_path"] == "/private/etc/hosts"
+           for s in reads), reads
+assert len(execs) == 32, execs
+bad = [s for s in execs if not (s["child_pid"] > 0 and s["rc"] == 0 and s["errno"] == 0
+                                and s["child_exit_code"] == 0 and s["child_term_signal"] == 0
+                                and s["error"] == "")]
+assert not bad, f"every exec must spawn and exit cleanly under the ceiling; first failures: {bad[:2]}"
+print("ok: 32 clean execs, a system import and both reads under a 64-descriptor hard ceiling")
+PY
+  local arc=$?
+  set -e
+  finish_from_assert_log "${arc}"
+}
+
+# ---- test_id: exec_setup_post_apply_denied ---------------------------------
+# Under bare (deny default) the post-apply pipe and spawn-handle setup must
+# succeed and the attempt must fail at posix_spawn itself: no child, a
+# permission errno, and an error naming posix_spawn rather than pipe() or a
+# spawn-handle call. This is the tripwire for a macOS revision that starts
+# gating the setup surface.
+
+run_exec_setup_post_apply_denied() {
+  run_harness_case "exec_setup_post_apply_denied" "exec_setup_post_apply_denied" \
+    "one exec slot under bare (deny default): setup succeeds post-apply and posix_spawn is the denied call" || return 0
+  set +e
+  "${PW_PYTHON}" -B -S -P - "${RESULT_FILE}" >"${PW_TEST_ARTIFACTS}/assert.log" 2>&1 <<'PY'
+import json, sys
+from pathlib import Path
+r = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert r["ready_byte_received"] and r["applied"] and r["apply_rc"] == 0 and r["done"], r
+assert not r["sent_sigkill"] and r["exit_code"] == 0 and r["term_signal"] is None, r
+assert r["failure_published"] == 0, r
+slots = r["slots"]
+assert len(slots) == 1 and slots[0]["completed"] == 1, slots
+s = slots[0]
+assert s["child_pid"] == 0 and s["rc"] == -1, s
+assert s["errno"] in (1, 13), f"expected EPERM (1) or EACCES (13) from posix_spawn, got {s['errno']}: {s}"
+assert s["child_exit_code"] == -1 and s["child_term_signal"] == 0, s
+assert s["error"].startswith("posix_spawn:"), f"the denied call must be posix_spawn, not setup: {s}"
+for setup_call in ("pipe(", "posix_spawn_file_actions", "posix_spawnattr"):
+    assert setup_call not in s["error"], s
+print(f"ok: post-apply setup succeeded under (deny default); posix_spawn denied with errno={s['errno']}")
+PY
+  local arc=$?
+  set -e
+  finish_from_assert_log "${arc}"
+}
+
+run_exec_pipes_per_attempt
+run_exec_setup_post_apply_denied
+
+# ---- test_id: exec_attempt_budget_{remainder,sequence} ---------------------
+# Six /bin/sleep helpers each outlive their deadline. The worker's exec attempt
+# budget clamps the last spawned child's deadline to the remainder, refuses
+# later exec steps before spawn, and the trailing read still runs; `done`
+# publishes near the budget edge instead of after six full deadlines.
+
+run_exec_attempt_budget() {
+  local test_id="$1" mode="$2"
+  run_harness_case "${test_id}" "${test_id}" \
+    "six deadline-hitting helpers under a shortened exec attempt budget (${mode})" || return 0
+  set +e
+  PW_MODE="${mode}" "${PW_PYTHON}" -B -S -P - "${RESULT_FILE}" >"${PW_TEST_ARTIFACTS}/assert.log" 2>&1 <<'PY'
+import errno, json, os, sys
+from pathlib import Path
+r = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+mode = os.environ["PW_MODE"]
+budget = {"remainder": 1000, "sequence": 1500}[mode]
+assert r["ready_byte_received"] and r["applied"] and r["apply_rc"] == 0 and r["done"], r
+assert not r["sent_sigkill"] and r["exit_code"] == 0 and r["term_signal"] is None, r
+assert r["failure_published"] == 0, f"a budget refusal is per-step evidence, never a run failure: {r}"
+slots = r["slots"]
+assert all(s["completed"] == 1 for s in slots), slots
+execs = [s for s in slots if "child_pid" in s]
+reads = [s for s in slots if "child_pid" not in s]
+assert len(execs) == 6 and [s["step_id"] for s in reads] == ["read_after_budget"], slots
+read = reads[0]
+assert read["rc"] == 0 and read["errno"] == 0 and read["observed_path"] == "/private/etc/hosts", read
+spawned = [s for s in execs if s["child_pid"] > 0]
+refused = [s for s in execs if s["child_pid"] == 0]
+assert spawned and refused, execs
+assert [s["child_pid"] > 0 for s in execs] == [True] * len(spawned) + [False] * len(refused), \
+    "spawns must precede refusals: the budget only runs down"
+for s in spawned:
+    assert s["rc"] == -1 and s["errno"] == 0, s
+    assert s["child_exit_code"] == -1 and s["child_term_signal"] == 9, s
+    assert "deadline" in s["error"] and "SIGKILL'd" in s["error"], s
+for s in refused:
+    assert s["rc"] == -1 and s["errno"] == errno.ETIMEDOUT, s
+    assert s["child_exit_code"] == -1 and s["child_term_signal"] == 0, s
+    assert s["stdout"] == "" and s["stderr"] == "", s
+    assert "exec attempt budget" in s["error"], s
+if mode == "remainder":
+    # A ten-second default deadline never fits a one-second budget: exactly one
+    # child spawns with the remainder as its deadline; the rest are refused.
+    assert len(spawned) == 1 and "exec attempt budget" in spawned[0]["error"], spawned
+else:
+    # Several 500 ms deadlines fit before the budget ends the sequence. Only the
+    # last spawned child can have been bounded by the remainder.
+    assert len(spawned) >= 2, spawned
+    assert all("exec attempt budget" not in s["error"] for s in spawned[:-1]), spawned
+span = r["done_after_applied_ms"]
+assert 0 <= span < budget + 1000, f"done must publish near the budget edge, not after every deadline: {span} ms"
+print(f"ok: {mode}: {len(spawned)} helper(s) killed at a deadline, {len(refused)} exec steps refused before spawn, "
+      f"trailing read succeeded, done {span} ms after applied")
+PY
+  local arc=$?
+  set -e
+  finish_from_assert_log "${arc}"
+}
+
+run_exec_attempt_budget "exec_attempt_budget_remainder" "remainder"
+run_exec_attempt_budget "exec_attempt_budget_sequence" "sequence"
+
+run_proceed_control() {
+  local scenario="$1"
+  run_harness_case "${scenario}" "${scenario}" "Exercise release, acknowledgement and attempt exclusion: ${scenario}" || return 0
+  set +e
+  "${PW_PYTHON}" -B -S "${ROOT_DIR}/tests/suites/runner_c_worker_harness/check_proceed.py" "${RESULT_FILE}" >"${PW_TEST_ARTIFACTS}/assert.log" 2>&1
+  local arc=$?
+  set -e
+  finish_from_assert_log "${arc}"
+}
+for scenario in proceed_never_set proceed_late_after_expiry proceed_before_applied \
+  proceed_delayed_observed_quiescence proceed_under_bare_deny_default \
+  proceed_wait_budget_short proceed_wait_budget_long proceed_expiry_release_boundary \
+  proceed_without_host_release max_slots_proceed; do
+  run_proceed_control "$scenario"
+done
+
+if test_selected sysctl_read_capacity; then
+  test_begin runner_c_worker_harness sysctl_read_capacity
+  test_step control "observe the actual sysctl call capacity and reject a shortened-capacity mutation"
+  if "${PW_PYTHON}" -B -S "${ROOT_DIR}/tests/suites/runner_c_worker_harness/check_sysctl.py" \
+      "${PW_TEST_ARTIFACTS}" >"${PW_TEST_ARTIFACTS}/control.log" 2>&1; then
+    test_pass "one non-null 4096-byte read, unchanged PW status/errno and rejected shortened capacity"
+  else
+    test_fail "sysctl call-boundary regression" "{\"log\":\"${PW_TEST_ARTIFACTS}/control.log\"}"
+  fi
+fi
+
+if test_selected clock_arithmetic; then
+  test_begin runner_c_worker_harness clock_arithmetic
+  test_step build "compile production clock helpers with a controlled timebase and raw counter"
+  CONTROL="${PW_TEST_ARTIFACTS}/clock-control"
+  test_build_fixture "${ROOT_DIR}/tests/fixtures/worker_lifecycle/build_clock_control.sh" "${CONTROL}"
+  if "${CONTROL}" >"${PW_TEST_ARTIFACTS}/control.log" 2>&1; then
+    test_pass "ceiling allowances, refusals, sample validation, sticky fault and setup publications"
+  else
+    test_fail "clock arithmetic regression" "{\"log\":\"${PW_TEST_ARTIFACTS}/control.log\"}"
+  fi
+fi
+
+if test_selected proceed_precedence; then
+  test_begin runner_c_worker_harness proceed_precedence
+  test_step build "compile the production proceed wait with a controlled counter and race gates"
+  CONTROL="${PW_TEST_ARTIFACTS}/proceed-control"
+  test_build_fixture "${ROOT_DIR}/tests/fixtures/worker_lifecycle/build_proceed_control.sh" "${CONTROL}"
+  if "${CONTROL}" >"${PW_TEST_ARTIFACTS}/control.log" 2>&1; then
+    test_pass "sampled-time precedence, fail-closed samples, exact exclusions and scheduled race limits"
+  else
+    test_fail "proceed precedence regression" "{\"log\":\"${PW_TEST_ARTIFACTS}/control.log\"}"
+  fi
+fi
+
+if test_selected exec_control_states; then
+  test_begin runner_c_worker_harness exec_control_states
+  test_step control "compare independent native call ledger and reject six exec evidence mutations"
+  if "${PW_PYTHON}" -B -S "${ROOT_DIR}/tests/suites/runner_c_worker_harness/check_exec_evidence.py" \
+      "${PW_TEST_ARTIFACTS}" >"${PW_TEST_ARTIFACTS}/control.log" 2>&1; then
+    test_pass "native call policy preserved; collection, cleanup requests and reap independently recorded; six mutations rejected"
+  else
+    test_fail "exec evidence control regression" "{\"log\":\"${PW_TEST_ARTIFACTS}/control.log\"}"
+  fi
+fi
+
+if test_selected terminal_erasure; then
+  test_begin runner_c_worker_harness terminal_erasure
+  test_step control "observe full accepted buffers and the done-store boundary; reject shortened and reversed erasure"
+  if "${PW_PYTHON}" -B -S "${ROOT_DIR}/tests/suites/runner_c_worker_harness/check_terminal_erasure.py" \
+      "${PW_TEST_ARTIFACTS}" >"${PW_TEST_ARTIFACTS}/control.log" 2>&1; then
+    test_pass "independent full-capacity and done-boundary erasure; ordinary exits preserved; both mutations rejected"
+  else
+    test_fail "terminal erasure control failed" "{\"log\":\"${PW_TEST_ARTIFACTS}/control.log\"}"
+  fi
+fi

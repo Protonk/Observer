@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+source "${ROOT_DIR}/tests/lib/case.sh"
+
+PW_TEST_SUITE="runner_unit"
+PW_TEST_ID="pwrunner_core_unit_executable"
+
+test_begin "${PW_TEST_SUITE}" "${PW_TEST_ID}"
+test_step "swift_run" "build and run PWRunnerCoreTests via SwiftPM"
+
+if ! command -v swift >/dev/null 2>&1; then
+  test_skip "swift toolchain not on PATH (install Xcode Command Line Tools)" "{}"
+  exit 0
+fi
+
+PACKAGE_DIR="${ROOT_DIR}/runner"
+if [[ ! -f "${PACKAGE_DIR}/Package.swift" ]]; then
+  test_skip "missing runner/Package.swift" "{}"
+  exit 0
+fi
+
+RUN_LOG="${PW_TEST_ARTIFACTS}/pwrunner_core_tests.log"
+
+test_step fixture "build the ABI-compatible child for required host lifecycle controls"
+export PW_LIFECYCLE_WORKER_FIXTURE="${PW_TEST_ARTIFACTS}/worker-lifecycle-fixture"
+test_build_fixture "${ROOT_DIR}/tests/fixtures/worker_lifecycle/build.sh" \
+  "${PW_LIFECYCLE_WORKER_FIXTURE}" "${PW_TEST_ARTIFACTS}/lifecycle-fixture-build.log"
+
+set +e
+swift run --package-path "${PACKAGE_DIR}" PWRunnerCoreTests >"${RUN_LOG}" 2>&1
+RC=$?
+set -e
+
+if [[ "${RC}" -ne 0 ]]; then
+  # Surface the last few lines of the log inline so the failure is visible
+  # in the events stream without needing the artifact path.
+  TAIL="$(tail -n 15 "${RUN_LOG}" | sed 's/"/\\"/g; s/\n/ /g')"
+  test_fail "PWRunnerCoreTests exited rc=${RC}; tail: ${TAIL}" \
+    "{\"log\":\"${RUN_LOG}\"}"
+fi
+
+if grep -Eq '^[[:space:]]*(SKIP|FAIL)[[:space:]]' "${RUN_LOG}"; then
+  # TestKit counts failures whose case overlapped system sleep.
+  SLEPT="$(grep -E '^[0-9]+ of [0-9]+ failures overlapped system sleep$' "${RUN_LOG}" | tail -n 1 || true)"
+  test_fail "required Swift cases reported internal SKIP/FAIL${SLEPT:+ (${SLEPT})}" "{\"log\":\"${RUN_LOG}\"}"
+fi
+
+# Parse the summary line ("N/M tests passed") to surface counts in the
+# success message.
+SUMMARY="$(grep -E '^[0-9]+/[0-9]+ tests passed$' "${RUN_LOG}" | tail -n 1 || true)"
+if [[ -z "${SUMMARY}" ]]; then
+  test_fail "PWRunnerCoreTests output missing summary line" "{\"log\":\"${RUN_LOG}\"}"
+fi
+
+test_step transfer_readers "replay actual driver replies through Rust assembly and the independent consumer"
+export PW_POLICY_TRANSFER_REPLIES="${PW_TEST_ARTIFACTS}"
+test_run_logged "${PW_TEST_ARTIFACTS}/transfer-readers.log" "policy transfer reader replay failed" \
+  cargo test --manifest-path "${ROOT_DIR}/controller/Cargo.toml" --bin policy-witness -- \
+  --include-ignored --exact run_flow::tests::policy_transfer_driver_replies_cross_assembly_and_consumer
+if ! grep -Fxq 'running 1 test' "${PW_TEST_ARTIFACTS}/transfer-readers.log"; then test_fail "transfer replay did not run"; fi
+
+test_step clock_readers "replay actual worker clock refusal replies through Rust assembly and the independent consumer"
+test_run_logged "${PW_TEST_ARTIFACTS}/clock-readers.log" "worker clock reader replay failed" \
+  cargo test --manifest-path "${ROOT_DIR}/controller/Cargo.toml" --bin policy-witness -- \
+  --include-ignored --exact run_flow::tests::worker_clock_driver_replies_cross_assembly_and_consumer
+if ! grep -Fxq 'running 1 test' "${PW_TEST_ARTIFACTS}/clock-readers.log"; then test_fail "worker clock replay did not run"; fi
+
+test_pass "${SUMMARY}" "{\"log\":\"${RUN_LOG}\"}"

@@ -1,0 +1,215 @@
+/*
+ * runner_abi_layout printer
+ *
+ * Compiled against controller/tools/pw_probe_runner/pw_probe_runner_abi.h
+ * at test time. Emits one KEY=VALUE line per ABI constant /
+ * sizeof / offsetof that the Swift PWShmLayout enum mirrors. The
+ * driver (run.sh) parses both this output and the Swift enum and
+ * asserts every key has a matching Swift constant with the
+ * identical numeric value.
+ *
+ * Parser-only source_drift can detect a missing constant but cannot
+ * model compiler-applied struct padding. This printer's offsetof()
+ * values are the ground truth — Swift's hand-mirrored offset
+ * constants are what we're checking against.
+ */
+
+#include <stdio.h>
+#include <stddef.h>
+
+#include "pw_probe_runner_abi.h"
+
+int main(void) {
+    /* Top-level constants. Keys are the C macro spellings so a
+     * reader of this file can grep them directly against the
+     * header; the driver maps each C name to its Swift counterpart. */
+    /* Emit actual bytes, independently of the generated printable spelling. */
+    printf("PW_WORKER_ABI_IDENTITY=");
+    for (size_t i = 0; i < sizeof(PW_WORKER_ABI_IDENTITY); i++) printf("%02x", PW_WORKER_ABI_IDENTITY[i]);
+    printf("\n");
+    printf("PW_SHM_ABI_MAGIC=%u\n", PW_SHM_ABI_MAGIC);
+    printf("PW_SHM_ABI_IDENTITY_BYTES=%u\n", PW_SHM_ABI_IDENTITY_BYTES);
+    printf("PW_SHM_HEADER_BYTES=%u\n",         PW_SHM_HEADER_BYTES);
+    printf("PW_SHM_POLICY_BYTES=%u\n", PW_SHM_POLICY_BYTES);
+    printf("PW_SHM_MAX_STEPS=%u\n",            PW_SHM_MAX_STEPS);
+    printf("PW_SHM_SLOT_BYTES=%u\n",           PW_SHM_SLOT_BYTES);
+    printf("PW_SHM_MAX_PARAMS=%u\n",           PW_SHM_MAX_PARAMS);
+    printf("PW_SHM_PARAM_BYTES=%u\n",          PW_SHM_PARAM_BYTES);
+    printf("PW_SHM_REGION_BYTES=%zu\n",        (size_t)PW_SHM_REGION_BYTES);
+    printf("PW_SHM_STEP_ID_MAX=%u\n",          PW_SHM_STEP_ID_MAX);
+    printf("PW_SHM_TARGET_MAX=%u\n",           PW_SHM_TARGET_MAX);
+    printf("PW_SHM_OBSERVED_PATH_MAX=%u\n",    PW_SHM_OBSERVED_PATH_MAX);
+    printf("PW_SHM_ERROR_MAX=%u\n",            PW_SHM_ERROR_MAX);
+    printf("PW_SHM_MAX_ARGV=%u\n",             PW_SHM_MAX_ARGV);
+    printf("PW_SHM_ARGV_BYTES=%u\n",           PW_SHM_ARGV_BYTES);
+    printf("PW_SHM_CHILD_OUTPUT_BYTES=%u\n",   PW_SHM_CHILD_OUTPUT_BYTES);
+    printf("PW_SHM_PARAM_KEY_MAX=%u\n",        PW_SHM_PARAM_KEY_MAX);
+    printf("PW_SHM_PARAM_VALUE_MAX=%u\n",      PW_SHM_PARAM_VALUE_MAX);
+    printf("PW_SHM_CAPTURE_HEADER_BYTES=%u\n", PW_SHM_CAPTURE_HEADER_BYTES);
+    printf("PW_SHM_CAPTURE_BYTES=%u\n", PW_SHM_CAPTURE_BYTES);
+    printf("PW_SHM_CAPTURE_NONCE_BYTES=%u\n", PW_SHM_CAPTURE_NONCE_BYTES);
+
+    /* sizeof cross-check: each per-struct budget macro must equal
+     * the actual sizeof of the struct it bounds. The header carries
+     * a _Static_assert for this; the test emits it again so a future
+     * refactor that removes the static assert can't silently drift. */
+    printf("sizeof.pw_shm_header_t=%zu\n",     sizeof(pw_shm_header_t));
+    printf("sizeof.pw_shm_slot_t=%zu\n",       sizeof(pw_shm_slot_t));
+    printf("sizeof.pw_shm_param_t=%zu\n",      sizeof(pw_shm_param_t));
+    printf("sizeof.pw_shm_capture_t=%zu\n", sizeof(pw_shm_capture_t));
+
+    printf("PW_SHM_MAX_PHASES=%u\n", PW_SHM_MAX_PHASES);
+    printf("PW_SHM_PHASE_BYTES=%u\n", PW_SHM_PHASE_BYTES);
+    printf("sizeof.pw_shm_phase_t=%zu\n", sizeof(pw_shm_phase_t));
+    printf("offsetof.pw_shm_header_t.phase_count=%zu\n", offsetof(pw_shm_header_t, phase_count));
+    printf("offsetof.pw_shm_header_t.phases=%zu\n", offsetof(pw_shm_header_t, phases));
+    printf("offsetof.pw_shm_phase_t.first_slot=%zu\n", offsetof(pw_shm_phase_t, first_slot));
+    printf("offsetof.pw_shm_phase_t.end_slot=%zu\n", offsetof(pw_shm_phase_t, end_slot));
+    printf("offsetof.pw_shm_phase_t.arrived=%zu\n", offsetof(pw_shm_phase_t, arrived));
+    printf("offsetof.pw_shm_phase_t.acknowledged=%zu\n", offsetof(pw_shm_phase_t, acknowledged));
+    printf("offsetof.pw_shm_phase_t.completed=%zu\n", offsetof(pw_shm_phase_t, completed));
+
+    /* Header field offsets. */
+    printf("offsetof.pw_shm_header_t.abi_magic=%zu\n",    offsetof(pw_shm_header_t, abi_magic));
+    printf("offsetof.pw_shm_header_t.abi_identity=%zu\n", offsetof(pw_shm_header_t, abi_identity));
+    printf("offsetof.pw_shm_header_t.step_count=%zu\n",     offsetof(pw_shm_header_t, step_count));
+    printf("offsetof.pw_shm_header_t.prepared=%zu\n",       offsetof(pw_shm_header_t, prepared));
+    printf("offsetof.pw_shm_header_t.applied=%zu\n",        offsetof(pw_shm_header_t, applied));
+    printf("offsetof.pw_shm_header_t.done=%zu\n",           offsetof(pw_shm_header_t, done));
+    printf("offsetof.pw_shm_header_t.exit_requested=%zu\n", offsetof(pw_shm_header_t, exit_requested));
+    printf("offsetof.pw_shm_header_t.apply_rc=%zu\n",       offsetof(pw_shm_header_t, apply_rc));
+    printf("offsetof.pw_shm_header_t.param_count=%zu\n",    offsetof(pw_shm_header_t, param_count));
+    printf("offsetof.pw_shm_header_t.apply_errno=%zu\n",    offsetof(pw_shm_header_t, apply_errno));
+    printf("offsetof.pw_shm_header_t.capture_requested=%zu\n", offsetof(pw_shm_header_t, capture_requested));
+    printf("offsetof.pw_shm_header_t.proceed=%zu\n", offsetof(pw_shm_header_t, proceed));
+    printf("offsetof.pw_shm_header_t.proceed_observed=%zu\n", offsetof(pw_shm_header_t, proceed_observed));
+    printf("offsetof.pw_shm_header_t.capture_nonce=%zu\n", offsetof(pw_shm_header_t, capture_nonce));
+
+    printf("offsetof.pw_shm_capture_t.completed=%zu\n", offsetof(pw_shm_capture_t, completed));
+    printf("offsetof.pw_shm_capture_t.status=%zu\n", offsetof(pw_shm_capture_t, status));
+    printf("offsetof.pw_shm_capture_t.profile_type=%zu\n", offsetof(pw_shm_capture_t, profile_type));
+    printf("offsetof.pw_shm_capture_t.bytecode_length=%zu\n", offsetof(pw_shm_capture_t, bytecode_length));
+    printf("offsetof.pw_shm_capture_t.worker_pid=%zu\n", offsetof(pw_shm_capture_t, worker_pid));
+    printf("offsetof.pw_shm_capture_t.source_length=%zu\n", offsetof(pw_shm_capture_t, source_length));
+    printf("offsetof.pw_shm_capture_t.param_count=%zu\n", offsetof(pw_shm_capture_t, param_count));
+    printf("offsetof.pw_shm_capture_t.source_sha256=%zu\n", offsetof(pw_shm_capture_t, source_sha256));
+    printf("offsetof.pw_shm_capture_t.params_sha256=%zu\n", offsetof(pw_shm_capture_t, params_sha256));
+    printf("offsetof.pw_shm_capture_t.bytecode_sha256=%zu\n", offsetof(pw_shm_capture_t, bytecode_sha256));
+    printf("offsetof.pw_shm_capture_t.request_nonce=%zu\n", offsetof(pw_shm_capture_t, request_nonce));
+
+    /* Slot field offsets. */
+    printf("offsetof.pw_shm_slot_t.step_id=%zu\n",            offsetof(pw_shm_slot_t, step_id));
+    printf("offsetof.pw_shm_slot_t.attempt_kind=%zu\n",       offsetof(pw_shm_slot_t, attempt_kind));
+    printf("offsetof.pw_shm_slot_t.target=%zu\n",             offsetof(pw_shm_slot_t, target));
+    printf("offsetof.pw_shm_slot_t.argv_count=%zu\n",         offsetof(pw_shm_slot_t, argv_count));
+    printf("offsetof.pw_shm_slot_t.argv=%zu\n",               offsetof(pw_shm_slot_t, argv));
+    printf("offsetof.pw_shm_slot_t.rc=%zu\n",                 offsetof(pw_shm_slot_t, rc));
+    printf("offsetof.pw_shm_slot_t.errno_val=%zu\n",          offsetof(pw_shm_slot_t, errno_val));
+    printf("offsetof.pw_shm_slot_t.observed_path=%zu\n",      offsetof(pw_shm_slot_t, observed_path));
+    printf("offsetof.pw_shm_slot_t.error=%zu\n",              offsetof(pw_shm_slot_t, error));
+    printf("offsetof.pw_shm_slot_t.child_pid=%zu\n",          offsetof(pw_shm_slot_t, child_pid));
+    printf("offsetof.pw_shm_slot_t.child_exit_code=%zu\n",    offsetof(pw_shm_slot_t, child_exit_code));
+    printf("offsetof.pw_shm_slot_t.child_term_signal=%zu\n",  offsetof(pw_shm_slot_t, child_term_signal));
+    printf("offsetof.pw_shm_slot_t.child_stdout=%zu\n",       offsetof(pw_shm_slot_t, child_stdout));
+    printf("offsetof.pw_shm_slot_t.child_stderr=%zu\n",       offsetof(pw_shm_slot_t, child_stderr));
+    printf("offsetof.pw_shm_slot_t.completed=%zu\n",          offsetof(pw_shm_slot_t, completed));
+
+    /* Native lifecycle publications and independently observed fresh reads. */
+    printf("PW_SHM_FRESH_READ_BYTES=%u\n", PW_SHM_FRESH_READ_BYTES);
+    printf("offsetof.pw_shm_header_t.extension_requested=%zu\n", offsetof(pw_shm_header_t, extension_requested));
+    printf("offsetof.pw_shm_header_t.extension_delivery_published=%zu\n", offsetof(pw_shm_header_t, extension_delivery_published));
+    printf("offsetof.pw_shm_header_t.extension_delivery_status=%zu\n", offsetof(pw_shm_header_t, extension_delivery_status));
+    printf("offsetof.pw_shm_header_t.extension_delivered_bytes=%zu\n", offsetof(pw_shm_header_t, extension_delivered_bytes));
+    printf("offsetof.pw_shm_header_t.extension_delivery_stage=%zu\n", offsetof(pw_shm_header_t, extension_delivery_stage));
+    printf("offsetof.pw_shm_header_t.extension_delivery_native_rc=%zu\n", offsetof(pw_shm_header_t, extension_delivery_native_rc));
+    printf("offsetof.pw_shm_header_t.extension_delivery_errno=%zu\n", offsetof(pw_shm_header_t, extension_delivery_errno));
+    printf("offsetof.pw_shm_header_t.extension_delivery_cleanup_stage=%zu\n", offsetof(pw_shm_header_t, extension_delivery_cleanup_stage));
+    printf("offsetof.pw_shm_header_t.extension_delivery_cleanup_errno=%zu\n", offsetof(pw_shm_header_t, extension_delivery_cleanup_errno));
+    /* Policy delivery acknowledgement: host expectation, worker EOF receipt and its flag. */
+    printf("offsetof.pw_shm_header_t.policy_bytes_expected=%zu\n", offsetof(pw_shm_header_t, policy_bytes_expected));
+    printf("offsetof.pw_shm_header_t.policy_bytes_received=%zu\n", offsetof(pw_shm_header_t, policy_bytes_received));
+    printf("offsetof.pw_shm_header_t.policy_read_published=%zu\n", offsetof(pw_shm_header_t, policy_read_published));
+    printf("offsetof.pw_shm_slot_t.call_boundary=%zu\n", offsetof(pw_shm_slot_t, call_boundary));
+    printf("offsetof.pw_shm_slot_t.native_result_valid=%zu\n", offsetof(pw_shm_slot_t, native_result_valid));
+    printf("offsetof.pw_shm_slot_t.native_result=%zu\n", offsetof(pw_shm_slot_t, native_result));
+    printf("offsetof.pw_shm_slot_t.native_errno=%zu\n", offsetof(pw_shm_slot_t, native_errno));
+    printf("offsetof.pw_shm_slot_t.unavailable_code=%zu\n", offsetof(pw_shm_slot_t, unavailable_code));
+    printf("offsetof.pw_shm_slot_t.access_open_rc=%zu\n", offsetof(pw_shm_slot_t, access_open_rc));
+    printf("offsetof.pw_shm_slot_t.access_open_errno=%zu\n", offsetof(pw_shm_slot_t, access_open_errno));
+    printf("offsetof.pw_shm_slot_t.access_read_rc=%zu\n", offsetof(pw_shm_slot_t, access_read_rc));
+    printf("offsetof.pw_shm_slot_t.access_read_errno=%zu\n", offsetof(pw_shm_slot_t, access_read_errno));
+    printf("offsetof.pw_shm_slot_t.access_close_rc=%zu\n", offsetof(pw_shm_slot_t, access_close_rc));
+    printf("offsetof.pw_shm_slot_t.access_close_errno=%zu\n", offsetof(pw_shm_slot_t, access_close_errno));
+    printf("offsetof.pw_shm_slot_t.access_stat_rc=%zu\n", offsetof(pw_shm_slot_t, access_stat_rc));
+    printf("offsetof.pw_shm_slot_t.access_stat_errno=%zu\n", offsetof(pw_shm_slot_t, access_stat_errno));
+    printf("offsetof.pw_shm_slot_t.access_mode=%zu\n", offsetof(pw_shm_slot_t, access_mode));
+    printf("offsetof.pw_shm_slot_t.access_device=%zu\n", offsetof(pw_shm_slot_t, access_device));
+    printf("offsetof.pw_shm_slot_t.access_inode=%zu\n", offsetof(pw_shm_slot_t, access_inode));
+    printf("offsetof.pw_shm_slot_t.access_uid=%zu\n", offsetof(pw_shm_slot_t, access_uid));
+    printf("offsetof.pw_shm_slot_t.access_gid=%zu\n", offsetof(pw_shm_slot_t, access_gid));
+    printf("offsetof.pw_shm_slot_t.access_bytes=%zu\n", offsetof(pw_shm_slot_t, access_bytes));
+
+    printf("offsetof.pw_shm_slot_t.exec_valid=%zu\n", offsetof(pw_shm_slot_t, exec_valid));
+    printf("offsetof.pw_shm_slot_t.exec_collection_stop=%zu\n", offsetof(pw_shm_slot_t, exec_collection_stop));
+    printf("offsetof.pw_shm_slot_t.exec_leader_exit_observed=%zu\n", offsetof(pw_shm_slot_t, exec_leader_exit_observed));
+    printf("offsetof.pw_shm_slot_t.exec_stdout_eof=%zu\n", offsetof(pw_shm_slot_t, exec_stdout_eof));
+    printf("offsetof.pw_shm_slot_t.exec_stderr_eof=%zu\n", offsetof(pw_shm_slot_t, exec_stderr_eof));
+    printf("offsetof.pw_shm_slot_t.exec_deadline_kind=%zu\n", offsetof(pw_shm_slot_t, exec_deadline_kind));
+    printf("offsetof.pw_shm_slot_t.exec_waitid_errno=%zu\n", offsetof(pw_shm_slot_t, exec_waitid_errno));
+    printf("offsetof.pw_shm_slot_t.exec_poll_errno=%zu\n", offsetof(pw_shm_slot_t, exec_poll_errno));
+    printf("offsetof.pw_shm_slot_t.exec_stdout_read_errno=%zu\n", offsetof(pw_shm_slot_t, exec_stdout_read_errno));
+    printf("offsetof.pw_shm_slot_t.exec_stderr_read_errno=%zu\n", offsetof(pw_shm_slot_t, exec_stderr_read_errno));
+    printf("offsetof.pw_shm_slot_t.exec_stdout_poll_revents=%zu\n", offsetof(pw_shm_slot_t, exec_stdout_poll_revents));
+    printf("offsetof.pw_shm_slot_t.exec_stderr_poll_revents=%zu\n", offsetof(pw_shm_slot_t, exec_stderr_poll_revents));
+    printf("offsetof.pw_shm_slot_t.exec_collection_clock_fault=%zu\n", offsetof(pw_shm_slot_t, exec_collection_clock_fault));
+    printf("offsetof.pw_shm_slot_t.exec_cleanup_state=%zu\n", offsetof(pw_shm_slot_t, exec_cleanup_state));
+    printf("offsetof.pw_shm_slot_t.exec_group_target=%zu\n", offsetof(pw_shm_slot_t, exec_group_target));
+    printf("offsetof.pw_shm_slot_t.exec_group_signal=%zu\n", offsetof(pw_shm_slot_t, exec_group_signal));
+    printf("offsetof.pw_shm_slot_t.exec_group_rc=%zu\n", offsetof(pw_shm_slot_t, exec_group_rc));
+    printf("offsetof.pw_shm_slot_t.exec_group_errno=%zu\n", offsetof(pw_shm_slot_t, exec_group_errno));
+    printf("offsetof.pw_shm_slot_t.exec_fallback_present=%zu\n", offsetof(pw_shm_slot_t, exec_fallback_present));
+    printf("offsetof.pw_shm_slot_t.exec_fallback_target=%zu\n", offsetof(pw_shm_slot_t, exec_fallback_target));
+    printf("offsetof.pw_shm_slot_t.exec_fallback_signal=%zu\n", offsetof(pw_shm_slot_t, exec_fallback_signal));
+    printf("offsetof.pw_shm_slot_t.exec_fallback_rc=%zu\n", offsetof(pw_shm_slot_t, exec_fallback_rc));
+    printf("offsetof.pw_shm_slot_t.exec_fallback_errno=%zu\n", offsetof(pw_shm_slot_t, exec_fallback_errno));
+    printf("offsetof.pw_shm_slot_t.exec_reap_stop=%zu\n", offsetof(pw_shm_slot_t, exec_reap_stop));
+    printf("offsetof.pw_shm_slot_t.exec_reap_wait_rc=%zu\n", offsetof(pw_shm_slot_t, exec_reap_wait_rc));
+    printf("offsetof.pw_shm_slot_t.exec_reap_wait_errno=%zu\n", offsetof(pw_shm_slot_t, exec_reap_wait_errno));
+    printf("offsetof.pw_shm_slot_t.exec_reap_status=%zu\n", offsetof(pw_shm_slot_t, exec_reap_status));
+    printf("offsetof.pw_shm_slot_t.exec_reap_clock_fault=%zu\n", offsetof(pw_shm_slot_t, exec_reap_clock_fault));
+
+    /* Param field offsets. */
+    printf("offsetof.pw_shm_param_t.key=%zu\n",   offsetof(pw_shm_param_t, key));
+    printf("offsetof.pw_shm_param_t.value=%zu\n", offsetof(pw_shm_param_t, value));
+
+    /* Region-derived offsets. Swift recomputes these from the size
+     * macros; emit them here too so any miscomputation on either
+     * side surfaces as a layout-guard failure rather than at runtime. */
+    printf("region.slots_offset=%zu\n",
+        (size_t)PW_SHM_HEADER_BYTES);
+    printf("region.params_offset=%zu\n",
+        (size_t)PW_SHM_HEADER_BYTES + (size_t)PW_SHM_MAX_STEPS * PW_SHM_SLOT_BYTES);
+    printf("region.capture_offset=%zu\n", (size_t)PW_SHM_HEADER_BYTES
+        + (size_t)PW_SHM_MAX_STEPS * PW_SHM_SLOT_BYTES + (size_t)PW_SHM_MAX_PARAMS * PW_SHM_PARAM_BYTES);
+
+    printf("PW_SHM_EVIDENCE_HEADER_BYTES=%u\n", PW_SHM_EVIDENCE_HEADER_BYTES);
+    printf("PW_SHM_DIAGNOSTIC_BYTES=%u\n", PW_SHM_DIAGNOSTIC_BYTES);
+    printf("region.evidence_offset=%zu\n", (size_t)PW_SHM_REGION_BYTES - PW_SHM_EVIDENCE_HEADER_BYTES - PW_SHM_DIAGNOSTIC_BYTES);
+    printf("sizeof.pw_shm_evidence_t=%zu\n", sizeof(pw_shm_evidence_t));
+    printf("offsetof.pw_shm_evidence_t.progress=%zu\n", offsetof(pw_shm_evidence_t, progress));
+    printf("offsetof.pw_shm_evidence_t.failure_published=%zu\n", offsetof(pw_shm_evidence_t, failure_published));
+    printf("offsetof.pw_shm_evidence_t.operation=%zu\n", offsetof(pw_shm_evidence_t, operation));
+    printf("offsetof.pw_shm_evidence_t.code=%zu\n", offsetof(pw_shm_evidence_t, code));
+    printf("offsetof.pw_shm_evidence_t.native_kind=%zu\n", offsetof(pw_shm_evidence_t, native_kind));
+    printf("offsetof.pw_shm_evidence_t.native_result=%zu\n", offsetof(pw_shm_evidence_t, native_result));
+    printf("offsetof.pw_shm_evidence_t.errno_val=%zu\n", offsetof(pw_shm_evidence_t, errno_val));
+    printf("offsetof.pw_shm_evidence_t.errno_present=%zu\n", offsetof(pw_shm_evidence_t, errno_present));
+    printf("offsetof.pw_shm_evidence_t.item_index=%zu\n", offsetof(pw_shm_evidence_t, item_index));
+    printf("offsetof.pw_shm_evidence_t.detail=%zu\n", offsetof(pw_shm_evidence_t, detail));
+    printf("offsetof.pw_shm_evidence_t.ready_published=%zu\n", offsetof(pw_shm_evidence_t, ready_published));
+    printf("offsetof.pw_shm_evidence_t.ready_rc=%zu\n", offsetof(pw_shm_evidence_t, ready_rc));
+    printf("offsetof.pw_shm_evidence_t.ready_errno=%zu\n", offsetof(pw_shm_evidence_t, ready_errno));
+    printf("offsetof.pw_shm_evidence_t.diagnostic_state=%zu\n", offsetof(pw_shm_evidence_t, diagnostic_state));
+    printf("offsetof.pw_shm_evidence_t.diagnostic_length=%zu\n", offsetof(pw_shm_evidence_t, diagnostic_length));
+    return 0;
+}
